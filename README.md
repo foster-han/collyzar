@@ -1,4 +1,4 @@
-# Collyzar
+# Collyzar Spider
 
 A distributed redis-based framework for colly.        
 
