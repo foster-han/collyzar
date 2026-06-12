@@ -1,8 +1,8 @@
-# Collyzar Spider again2
+# Collyzar Spider again
 A distributed redis-based framework for colly.        
 
 Collyzar provides a very simple configuration and tools to implement distributed crawling/scraping.       
-## Feature List
+## Features
 - Simple configuration and clean API       
 - Distributed crawling/scraping     
 - Built-in global bloom filter        
@@ -11,7 +11,7 @@ Collyzar provides a very simple configuration and tools to implement distributed
 - Multi-machine load balancing    
 - Support to pause or stop all crawling machines     
 - Pass additional information to the crawler and get it inside the crawler and store it in the database
-## Installation Guide
+## Installation
 Add collyzar to your go.mod file:       
 ```
 module github.com/x/y
