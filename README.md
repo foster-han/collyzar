@@ -86,7 +86,7 @@ func main() {
 }
 
 ```
-## Bugs
+## Bug list
 Bugs or suggestions? Visit the [issue tracker](https://github.com/Zartenc/collyzar/issues)    
 ## Contributing
 If you wish to contribute to this project, please branch and issue a pull request against master ("[GitHub Flow](https://guides.github.com/introduction/flow/)").
