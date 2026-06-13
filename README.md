@@ -2,7 +2,7 @@
 A distributed redis-based framework for colly.        
 
 Collyzar provides a very simple configuration and tools to implement distributed crawling/scraping.       
-## Features
+## Feature List
 - Simple configuration and clean API       
 - Distributed crawling/scraping     
 - Built-in global bloom filter        
@@ -86,7 +86,7 @@ func main() {
 }
 
 ```
-## Bugs
+## Bug list
 Bugs or suggestions? Visit the [issue tracker](https://github.com/Zartenc/collyzar/issues)    
 ## Contributing
 If you wish to contribute to this project, please branch and issue a pull request against master ("[GitHub Flow](https://guides.github.com/introduction/flow/)").
