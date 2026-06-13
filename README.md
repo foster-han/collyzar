@@ -2,7 +2,7 @@
 A distributed redis-based framework for colly.        
 
 Collyzar provides a very simple configuration and tools to implement distributed crawling/scraping.       
-## Features
+## Feature List
 - Simple configuration and clean API       
 - Distributed crawling/scraping     
 - Built-in global bloom filter        
