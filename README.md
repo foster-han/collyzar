@@ -1,4 +1,4 @@
-# Collyzar Spider again 33
+# Collyzar Spider again 39
 A distributed redis-based framework for colly.        
 
 Collyzar provides a very simple configuration and tools to implement distributed crawling/scraping.       
