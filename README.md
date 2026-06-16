@@ -72,7 +72,7 @@ func main() {
 }
 
 ```
-##### Pause  all crawlers
+##### Pause  all crawlers 3
 For all crawlers, the crawler process is idle after pausing the crawler.  
 Then you can use the **WakeupSpiders** method to wake up the crawlers.     
 ```
