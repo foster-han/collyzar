@@ -5,7 +5,7 @@ allowed-tools: Bash, Read, Glob, Grep, Write, Task, WebFetch
 
 
 You are reviewing a Pull Request for the current feature branch. Follow these steps:
-## Step 0: Identify the PR
+## Step 0: Identify the PR From Github
 First, get the current branch and find the matching open PR:
 ```bash
 # Get current branch name
