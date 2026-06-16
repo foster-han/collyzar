@@ -43,7 +43,7 @@ func myResponse(response *collyzar.ZarResponse){
 }
 ```
 ### Control machine
-#### Push url to redis queue
+#### Push url to redis queue333
 ```
 func main(){
 	ts := collyzar.NewToolSpider("127.0.0.1", 6379, "", "zarten")
