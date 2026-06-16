@@ -33,7 +33,7 @@
 
 ### Redis Key
 ```
-cs:lock:{orgSlug}:{changesetId}
+cs1:lock:{orgSlug}:{changesetId}
 ```
 - `orgSlug`：来自 `getTenantContext().orgSlug`，确保多租户隔离（不同租户的 changesetId 数字可能重叠）
 - `changesetId`：`SyncCommit.id`
