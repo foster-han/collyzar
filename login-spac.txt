@@ -1,0 +1,269 @@
+概述
+基于 better-auth、ioredis、argon2id 和 SendGrid 为 Jolli 应用实现统一的认证系统，包括密码认证和 OAuth 认证（Google、GitHub）。使用 better-auth 内置的 OAuth 方案替代现有的 Grant 库实现。
+
+1. 技术架构
+1.1 技术栈
+better-auth: 认证库
+ioredis: Redis 客户端（会话、限流、暴力破解保护）
+argon2id: 密码哈希算法
+SendGrid: 邮件发送服务
+
+1.3 better-auth OAuth 配置
+
+// backend/src/auth/auth.ts
+
+import { betterAuth } from "better-auth";
+import { Pool } from "pg";
+
+export const auth = betterAuth({
+  database: new Pool({
+    connectionString: process.env.MANAGER_DATABASE_URL,
+  }),
+
+  // 邮箱密码认证
+  emailAndPassword: {
+    enabled: true,
+    requireEmailVerification: true,
+  },
+
+  // OAuth 提供商配置
+  socialProviders: {
+    google: {
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    },
+    github: {
+      clientId: process.env.GITHUB_CLIENT_ID!,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET!,
+    },
+  },
+
+  // Session 配置
+  session: {
+    expiresIn: 60 * 60 * 24 * 7, // 7 天
+    updateAge: 60 * 60 * 24,     // 每天更新
+    cookieCache: {
+      enabled: true,
+      maxAge: 60 * 5, // 5 分钟缓存
+    },
+  },
+
+  // Cookie 配置 - 跨子域共享
+  advanced: {
+    cookiePrefix: "jolli",
+    crossSubDomainCookies: {
+      enabled: true,
+      domain: ".jolli.ai", // 根域名
+    },
+  },
+
+  // 用户创建时的回调
+  user: {
+    additionalFields: {
+      isActive: {
+        type: "boolean",
+        required: false,
+        defaultValue: false,
+      },
+    },
+  },
+});
+1.4 前端 better-auth 客户端
+
+// frontend/src/lib/auth-client.ts
+
+import { createAuthClient } from "better-auth/react";
+
+export const authClient = createAuthClient({
+  baseURL: "https://jolli.ai",
+});
+
+// 使用示例
+// 密码登录
+await authClient.signIn.email({
+  email: "user@example.com",
+  password: "password123",
+});
+
+// Google OAuth 登录
+await authClient.signIn.social({
+  provider: "google",
+  callbackURL: "/auth/callback",
+});
+
+// GitHub OAuth 登录
+await authClient.signIn.social({
+  provider: "github",
+  callbackURL: "/auth/callback",
+});
+
+// 获取当前用户
+const session = await authClient.getSession();
+
+2.2 密码登录流程 (Credential Flow)
+
+1. 用户访问 jolli.ai，输入 Email/Password
+2. 前端调用 authClient.signIn.email
+3. 后端检查：
+   a. 暴力破解保护（IP + Email 双维度）
+   b. 用户是否已激活（is_active=true）
+4. Better Auth 验证密码
+5. 登录成功后：
+   a. 生成 Session ID（UUID）
+   b. 将 Session 数据存入 Redis（见 6.3 节 createSession）
+   c. 设置 Cookie 在 .jolli.ai（跨子域名共享，包含 Session ID）
+6. 返回当前用户所属的 tenants 列表
+7. 前端展示 tenants 供用户选择
+8. 用户选择 tenant 后跳转：window.location.href = 'https://{slug}.jolli.ai/dashboard'
+2.3 OAuth 登录流程 (Social Flow - better-auth)
+2.3.1 OAuth 登录流程
+
+1. 用户点击 Google/GitHub 按钮
+2. 前端调用 authClient.signIn.social({ provider: "google" | "github" })
+3. better-auth 自动处理：
+   a. 生成 state 和 code_verifier (PKCE)
+   b. 重定向到 OAuth 提供商授权页面
+4. 用户在 OAuth 提供商页面完成授权
+5. OAuth 提供商重定向回 jolli.ai/api/auth/callback/{provider}
+6. better-auth 后端处理：
+   a. 验证 state 和 code
+   b. 使用 code 换取 access_token
+   c. 获取用户信息 (email, name, picture)
+   d. 查找或创建 org_users（OAuth 用户自动激活，is_active=true）
+   e. 创建或更新 org_auths 记录（provider, provider_id, access_token, refresh_token）
+   f. 生成 Session ID（UUID）
+   g. 将 Session 数据存入 Redis（见 6.3 节 createSession）
+   h. 设置 Cookie 在 .jolli.ai（包含 Session ID）
+7. 重定向到 /auth/callback 前端页面
+8. 前端检测到登录成功（Cookie 已设置）
+9. 调用 GET /api/auth/tenants 获取 tenants 列表
+10. 前端展示 tenants 供用户选择
+11. 用户选择 tenant 后跳转：window.location.href = 'https://{slug}.jolli.ai/dashboard'
+2.3.2 OAuth 账号关联
+
+场景：用户已有密码账号，后续想要关联 OAuth 登录
+
+1. 用户已登录状态下，进入账号设置页面
+2. 点击「关联 Google 账号」或「关联 GitHub 账号」
+3. 前端调用 authClient.linkSocial({ provider: "google" | "github" })
+4. 完成 OAuth 流程后，org_auths 表新增一条记录：
+   - user_id: 当前用户 ID
+   - provider: "google" | "github"
+   - provider_id: OAuth 提供商返回的用户 ID
+5. 下次用户可以使用 OAuth 或密码登录同一账号
+2.3.3 OAuth 登录时的邮箱冲突处理
+
+场景：OAuth 返回的邮箱已存在于系统中（通过密码注册）
+
+处理策略（可配置）：
+1. 自动关联（推荐）：
+   - 如果 OAuth 邮箱已验证，自动关联到现有账号
+   - 在 org_auths 表新增 OAuth 记录，关联到现有 user_id
+
+2. 拒绝登录：
+   - 返回错误："该邮箱已注册，请使用密码登录"
+   - 提示用户可以登录后手动关联 OAuth
+
+配置项：
+OAUTH_EMAIL_CONFLICT_STRATEGY: "auto_link" | "reject"
+2.3.4 better-auth OAuth 端点
+方法	路径	描述
+GET	/api/auth/signin/google	发起 Google OAuth
+GET	/api/auth/signin/github	发起 GitHub OAuth
+GET	/api/auth/callback/google	Google OAuth 回调
+GET	/api/auth/callback/github	GitHub OAuth 回调
+POST	/api/auth/link/google	关联 Google 账号（已登录）
+POST	/api/auth/link/github	关联 GitHub 账号（已登录）
+POST	/api/auth/unlink/{provider}	解除 OAuth 关联（已登录）
+
+
+3. 数据库设计 (Manager DB)
+3.1 org_users 表
+
+CREATE TABLE org_users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT false,  -- 注册后默认未激活
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_org_users_email ON org_users(email);
+CREATE INDEX idx_org_users_is_active ON org_users(is_active);
+3.2 org_auths 表
+
+CREATE TABLE org_auths (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  provider VARCHAR(50) NOT NULL,          -- 'password' | 'google' | 'github'
+  provider_id VARCHAR(255),               -- OAuth 的 sub (password 时为 null)
+  provider_email VARCHAR(255),
+
+  -- 密码登录字段 (仅 provider='password' 时有值)
+  password_hash VARCHAR(255),
+  password_salt VARCHAR(255),
+  password_algo VARCHAR(50),              -- 'argon2id'
+  password_iterations INTEGER,
+
+  -- OAuth 登录字段 (仅 OAuth 时有值)
+  access_token TEXT,
+  refresh_token TEXT,
+  token_expires_at TIMESTAMPTZ,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE(provider, provider_id)
+);
+
+CREATE INDEX idx_org_auths_user_id ON org_auths(user_id);
+CREATE INDEX idx_org_auths_provider ON org_auths(provider);
+
+3.5 password_history 表
+
+-- 密码历史表
+-- 用于检查新密码不能与最近 5 次使用过的密码相同
+
+CREATE TABLE password_history (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  password_hash VARCHAR(255) NOT NULL,    -- argon2id 哈希后的密码
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_password_history_user_id ON password_history(user_id);
+CREATE INDEX idx_password_history_created_at ON password_history(created_at);
+
+-- 注意：每个用户最多保留 5 条记录，超过时删除最旧的
+3.6 user_orgs 表 (Manager DB)
+
+-- 用户-组织关系表（Manager DB）
+-- 记录用户属于哪些组织，以及用户在该组织的角色和访问信息
+
+CREATE TABLE user_orgs (
+  id SERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  org_id VARCHAR(255) NOT NULL,                 -- 组织 ID（字符串类型）
+  role VARCHAR(20) NOT NULL DEFAULT 'member',   -- 用户在该租户的角色：'owner' | 'admin' | 'member'
+  is_default BOOLEAN NOT NULL DEFAULT false,    -- 是否为默认租户
+  last_accessed_at TIMESTAMPTZ,                 -- 最后访问时间
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE(user_id, org_id)
+);
+
+CREATE INDEX idx_user_orgs_user_id ON user_orgs(user_id);
+CREATE INDEX idx_user_orgs_user_id_is_default ON user_orgs(user_id, is_default);
+
+-- 字段说明：
+-- role: 用户在该组织的角色，与 Tenant DB users.role 保持一致（冗余存储，便于 Manager 查询）
+-- is_default: 用户的默认租户，登录后自动跳转到该租户
+-- last_accessed_at: 最后访问时间，用于排序租户列表
+
+-- 用途：
+-- 1. 记录用户属于哪些组织（一个用户可以属于多个组织）
+-- 2. 用于登录后获取用户的租户列表
+-- 3. 记录用户在每个组织的角色（冗余存储，便于快速查询）
+-- 4. 支持默认租户和最近访问排序功能
+

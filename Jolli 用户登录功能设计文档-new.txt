@@ -1,0 +1,2689 @@
+Jolli 用户登录功能设计文档
+概述
+基于 better-auth、ioredis、argon2id 和 SendGrid 为 Jolli 应用实现统一的认证系统，包括密码认证和 OAuth 认证（Google、GitHub）。使用 better-auth 内置的 OAuth 方案替代现有的 Grant 库实现。
+
+1. 技术架构
+1.1 技术栈
+better-auth: 认证库
+ioredis: Redis 客户端（会话、限流、暴力破解保护）
+argon2id: 密码哈希算法
+SendGrid: 邮件发送服务
+1.2 架构图
+
++-----------------------------------------------------------------------------------------------+
+|                                    Frontend (React/Preact)                                     |
++-----------------------------------------------------------------------------------------------+
+| LoginPage | RegisterPage | ActivateUserPage | ResetPasswordPage | AcceptInvitePage | Logout   |
++-----+-----+------+-------+--------+---------+---------+---------+--------+---------+----+-----+
+      |            |                |                   |                  |              |
+      v            v                v                   v                  v              v
++-----------------------------------------------------------------------------------------------+
+|                                    Backend API (Express)                                       |
++-----------------------------------------------------------------------------------------------+
+|                                                                                               |
+|  +-------------+  +-------------+  +----------------+  +-------------+  +------------------+  |
+|  | POST        |  | POST        |  | POST           |  | POST        |  | POST             |  |
+|  | /sign-in    |  | /register   |  | /activate      |  | /sign-out   |  | /invite          |  |
+|  | (密码登录)   |  | (注册)       |  | (激活账号)      |  | (登出)       |  | (发送邀请)        |  |
+|  +------+------+  +------+------+  +-------+--------+  +------+------+  +--------+---------+  |
+|         |                |                 |                  |                  |            |
+|  +------v------+  +------v------+  +-------v--------+  +------v------+  +--------v---------+  |
+|  | GET/POST    |  | POST        |  | POST           |  | DELETE      |  | POST             |  |
+|  | /oauth/*    |  | /forgot-pwd |  | /reset-pwd     |  | Session     |  | /accept-invite   |  |
+|  | (OAuth登录)  |  | (忘记密码)   |  | (重置密码)      |  | (删除会话)   |  | (接受邀请)        |  |
+|  +-------------+  +-------------+  +----------------+  +-------------+  +------------------+  |
+|                                                                                               |
++------------------------------------------+----------------------------------------------------+
+                                           |
+             +-----------------------------+-----------------------------+
+             |                             |                             |
+             v                             v                             v
++------------------------+    +---------------------------+    +-------------------+
+|   Redis                |    |   Manager DB (jolli)      |    |   SendGrid        |
+|   (ioredis)            |    |   (PostgreSQL)            |    |   (Email)         |
++------------------------+    +---------------------------+    +-------------------+
+| - Sessions (验证用)     |    | - org_users (全局用户账号)  |    | - 注册验证邮件     |
+| - Rate Limiting        |    | - org_auths (认证方式)     |    | - 密码重置邮件     |
+| - Brute Force          |    | - password_history        |    | - 邀请邮件        |
+| - Email Limiting       |    | - rememberme_tokens       |    +-------------------+
+| - Invite Limiting      |    | - email_verifications     |
++------------------------+    | - user_orgs (用户-组织关系) |
+                              +---------------------------+
+
+                              +---------------------------+
+                              |   Tenant DB               |
+                              |   (每个租户独立数据库)      |
+                              +---------------------------+
+                              | - users (角色+资料)        |
+                              | - user_sessions (设备记录) |
+                              | - user_invitations (邀请) |
+                              +---------------------------+
+1.2.1 认证流程总览
+
++------------------+     +------------------+     +------------------+     +------------------+
+|     注册流程      |     |     登录流程      |     |     登出流程      |     |     邀请流程      |
++------------------+     +------------------+     +------------------+     +------------------+
+|                  |     |                  |     |                  |     |                  |
+| 1. 填写表单       |     | 1. 输入凭证       |     | 1. 点击登出       |     | 1. Admin/Owner   |
+|    (email,name)  |     |    (email/pwd    |     |                  |     |    发送邀请       |
+|                  |     |     或 OAuth)    |     | 2. 删除 Redis    |     |                  |
+| 2. 发送验证邮件   |     |                  |     |    Session       |     | 2. 发送邀请邮件   |
+|                  |     | 2. 验证凭证       |     |                  |     |                  |
+| 3. 点击激活链接   |     |                  |     | 3. 清除 Cookie   |     | 3. 点击邀请链接   |
+|                  |     | 3. 创建 Session   |     |                  |     |                  |
+| 4. 设置密码       |     |    (Redis)       |     | 4. 可选：清除     |     | 4. 已注册：登录   |
+|                  |     |                  |     |    Remember Me   |     |    未注册：注册   |
+| 5. 账号激活       |     | 4. 设置 Cookie    |     |                  |     |                  |
++------------------+     +------------------+     +------------------+     | 5. 加入租户       |
+                                                                          +------------------+
+1.3 better-auth OAuth 配置
+
+// backend/src/auth/auth.ts
+
+import { betterAuth } from "better-auth";
+import { Pool } from "pg";
+
+export const auth = betterAuth({
+  database: new Pool({
+    connectionString: process.env.MANAGER_DATABASE_URL,
+  }),
+
+  // 邮箱密码认证
+  emailAndPassword: {
+    enabled: true,
+    requireEmailVerification: true,
+  },
+
+  // OAuth 提供商配置
+  socialProviders: {
+    google: {
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    },
+    github: {
+      clientId: process.env.GITHUB_CLIENT_ID!,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET!,
+    },
+  },
+
+  // Session 配置
+  session: {
+    expiresIn: 60 * 60 * 24 * 7, // 7 天
+    updateAge: 60 * 60 * 24,     // 每天更新
+    cookieCache: {
+      enabled: true,
+      maxAge: 60 * 5, // 5 分钟缓存
+    },
+  },
+
+  // Cookie 配置 - 跨子域共享
+  advanced: {
+    cookiePrefix: "jolli",
+    crossSubDomainCookies: {
+      enabled: true,
+      domain: ".jolli.ai", // 根域名
+    },
+  },
+
+  // 用户创建时的回调
+  user: {
+    additionalFields: {
+      isActive: {
+        type: "boolean",
+        required: false,
+        defaultValue: false,
+      },
+    },
+  },
+});
+1.4 前端 better-auth 客户端
+
+// frontend/src/lib/auth-client.ts
+
+import { createAuthClient } from "better-auth/react";
+
+export const authClient = createAuthClient({
+  baseURL: "https://jolli.ai",
+});
+
+// 使用示例
+// 密码登录
+await authClient.signIn.email({
+  email: "user@example.com",
+  password: "password123",
+});
+
+// Google OAuth 登录
+await authClient.signIn.social({
+  provider: "google",
+  callbackURL: "/auth/callback",
+});
+
+// GitHub OAuth 登录
+await authClient.signIn.social({
+  provider: "github",
+  callbackURL: "/auth/callback",
+});
+
+// 获取当前用户
+const session = await authClient.getSession();
+2. 认证流程
+2.1 用户注册激活流程 (Registration Flow)
+2.1.1 注册流程（无密码注册）
+
+1. 用户前端填写注册信息：
+   - Email（必填）
+   - Name（必填）
+   - 注意：注册时不需要填写密码
+2. 前端验证：
+   a. Email 格式有效
+   b. Name 不为空（2-100字符）
+3. 提交注册请求到 POST /api/auth/register
+4. 后端处理：
+   a. 验证输入：
+      - Email 格式有效
+      - Name 不为空（2-100字符）
+   b. 检查 Email 是否已注册
+   c. 检查邮件发送限流（verification: 5次/小时）
+   d. 创建用户记录（org_users，is_active=false）
+      - 不创建 org_auths 密码记录（稍后在设置密码时创建）
+   e. 生成验证 JWT Token（type='registration'）
+   f. 计算 SHA256(token) 存入 email_verifications 表
+   g. 通过 SendGrid 发送验证邮件
+5. 前端显示成功提示："验证邮件已发送，请查收邮箱完成注册"
+2.1.2 邮箱验证 + 设置密码
+
+1. 用户收到邮件，点击激活链接：https://jolli.ai/activate_user?token={jwt_token}
+2. 前端 ActivateUserPage 加载：
+   a. 从 URL 提取 token 参数
+   b. 调用 POST /api/auth/verify-activation-token 验证 Token 有效性
+   c. Token 无效或过期：显示错误页面，提供"重新发送"链接
+   d. Token 有效：显示设置密码表单
+3. 用户输入密码和确认密码
+4. 前端验证：
+   a. 密码符合强度要求（8字符、大小写、数字、特殊字符）
+   b. 两次输入一致
+5. 前端调用 POST /api/auth/activate
+6. 后端处理：
+   a. 验证 JWT 签名（防篡改）
+   b. 检查 JWT 是否过期（24小时有效期）
+   c. 计算 SHA256(token) 查询数据库（防重放）
+   d. 检查记录存在（Token 未使用）
+   e. 验证 token.type === 'registration'
+   f. 验证密码强度
+   g. 使用 argon2id 哈希密码
+   h. 创建 org_auths 记录（provider='password'）
+   i. 更新 org_users.is_active = true
+   j. 删除 email_verifications 表中对应记录（而非标记 used_at）
+   k. 记录审计日志
+7. 返回成功响应
+8. 前端跳转到登录页，显示"账号激活成功，请登录"
+2.1.3 注册表单字段
+字段	类型	必填	验证规则
+email	string	是	有效邮箱格式
+name	string	是	2-100 字符
+2.1.4 为什么不在注册时填写密码？
+
+1. 安全性：确保邮箱真实有效后再设置密码，防止恶意注册
+2. 用户体验：减少注册步骤，降低注册流失率
+3. 防止垃圾账号：未验证邮箱的账号没有密码，无法登录
+4. 符合常见实践：类似 Linear、Notion 等产品的注册流程
+2.2 密码登录流程 (Credential Flow)
+
+1. 用户访问 jolli.ai，输入 Email/Password
+2. 前端调用 authClient.signIn.email
+3. 后端检查：
+   a. 暴力破解保护（IP + Email 双维度）
+   b. 用户是否已激活（is_active=true）
+4. Better Auth 验证密码
+5. 登录成功后：
+   a. 生成 Session ID（UUID）
+   b. 将 Session 数据存入 Redis（见 6.3 节 createSession）
+   c. 设置 Cookie 在 .jolli.ai（跨子域名共享，包含 Session ID）
+6. 返回当前用户所属的 tenants 列表
+7. 前端展示 tenants 供用户选择
+8. 用户选择 tenant 后跳转：window.location.href = 'https://{slug}.jolli.ai/dashboard'
+2.3 OAuth 登录流程 (Social Flow - better-auth)
+2.3.1 OAuth 登录流程
+
+1. 用户点击 Google/GitHub 按钮
+2. 前端调用 authClient.signIn.social({ provider: "google" | "github" })
+3. better-auth 自动处理：
+   a. 生成 state 和 code_verifier (PKCE)
+   b. 重定向到 OAuth 提供商授权页面
+4. 用户在 OAuth 提供商页面完成授权
+5. OAuth 提供商重定向回 jolli.ai/api/auth/callback/{provider}
+6. better-auth 后端处理：
+   a. 验证 state 和 code
+   b. 使用 code 换取 access_token
+   c. 获取用户信息 (email, name, picture)
+   d. 查找或创建 org_users（OAuth 用户自动激活，is_active=true）
+   e. 创建或更新 org_auths 记录（provider, provider_id, access_token, refresh_token）
+   f. 生成 Session ID（UUID）
+   g. 将 Session 数据存入 Redis（见 6.3 节 createSession）
+   h. 设置 Cookie 在 .jolli.ai（包含 Session ID）
+7. 重定向到 /auth/callback 前端页面
+8. 前端检测到登录成功（Cookie 已设置）
+9. 调用 GET /api/auth/tenants 获取 tenants 列表
+10. 前端展示 tenants 供用户选择
+11. 用户选择 tenant 后跳转：window.location.href = 'https://{slug}.jolli.ai/dashboard'
+2.3.2 OAuth 账号关联
+
+场景：用户已有密码账号，后续想要关联 OAuth 登录
+
+1. 用户已登录状态下，进入账号设置页面
+2. 点击「关联 Google 账号」或「关联 GitHub 账号」
+3. 前端调用 authClient.linkSocial({ provider: "google" | "github" })
+4. 完成 OAuth 流程后，org_auths 表新增一条记录：
+   - user_id: 当前用户 ID
+   - provider: "google" | "github"
+   - provider_id: OAuth 提供商返回的用户 ID
+5. 下次用户可以使用 OAuth 或密码登录同一账号
+2.3.3 OAuth 登录时的邮箱冲突处理
+
+场景：OAuth 返回的邮箱已存在于系统中（通过密码注册）
+
+处理策略（可配置）：
+1. 自动关联（推荐）：
+   - 如果 OAuth 邮箱已验证，自动关联到现有账号
+   - 在 org_auths 表新增 OAuth 记录，关联到现有 user_id
+
+2. 拒绝登录：
+   - 返回错误："该邮箱已注册，请使用密码登录"
+   - 提示用户可以登录后手动关联 OAuth
+
+配置项：
+OAUTH_EMAIL_CONFLICT_STRATEGY: "auto_link" | "reject"
+2.3.4 better-auth OAuth 端点
+方法	路径	描述
+GET	/api/auth/signin/google	发起 Google OAuth
+GET	/api/auth/signin/github	发起 GitHub OAuth
+GET	/api/auth/callback/google	Google OAuth 回调
+GET	/api/auth/callback/github	GitHub OAuth 回调
+POST	/api/auth/link/google	关联 Google 账号（已登录）
+POST	/api/auth/link/github	关联 GitHub 账号（已登录）
+POST	/api/auth/unlink/{provider}	解除 OAuth 关联（已登录）
+2.4 忘记密码/密码重置流程 (Forgot Password / Password Reset Flow)
+2.4.1 发起密码重置请求
+
+1. 用户在登录页点击「忘记密码」链接
+2. 跳转到 https://jolli.ai/forgot-password
+3. 用户输入注册邮箱
+4. 前端调用 POST /api/auth/forgot-password
+5. 后端处理：
+   a. 查找用户是否存在（通过 email 查询 org_users）
+   b. 检查用户是否有密码登录方式（org_auths.provider = 'password'）
+      - 如果只有 OAuth 登录，返回提示："该账号通过 Google/GitHub 登录，无需重置密码"
+   c. 检查邮件发送限流（password_reset: 3次/小时）
+      - 超过限制返回 429 Too Many Requests
+   d. 生成密码重置 JWT Token（包含 user_id、email、type='password_reset'）
+   e. 计算 SHA256(token) 存入 email_verifications 表
+   f. 通过 SendGrid 发送重置邮件
+6. 前端显示成功提示："如果该邮箱已注册，您将收到一封密码重置邮件"
+   - 注意：无论用户是否存在，都显示相同提示（防止用户枚举）
+2.4.2 重置密码
+
+1. 用户收到邮件，点击链接：https://jolli.ai/reset-password?token={jwt_token}
+2. 前端 ResetPasswordPage 加载：
+   a. 从 URL 提取 token 参数
+   b. 调用 POST /api/auth/verify-reset-token 验证 Token 有效性
+   c. Token 无效或过期：显示错误页面，提供"重新发送"链接
+   d. Token 有效：显示新密码输入表单
+3. 用户输入新密码和确认密码
+4. 前端验证：
+   a. 密码符合强度要求（8字符、大小写、数字、特殊字符）
+   b. 两次输入一致
+5. 前端调用 POST /api/auth/reset-password
+6. 后端处理：
+   a. 验证 JWT 签名（防篡改）
+   b. 检查 JWT 是否过期（1小时有效期）
+   c. 计算 SHA256(token) 查询数据库（防重放）
+   d. 检查记录存在（Token 未使用）
+   e. 验证 token.type === 'password_reset'
+   f. 验证新密码强度
+   g. 检查新密码不与最近 5 次使用过的密码相同（查询 password_history 表）
+   h. 将当前密码存入 password_history 表（保留最近 5 条）
+   i. 使用 argon2id 哈希新密码
+   j. 更新 org_auths 表中的 password_hash、password_salt、updated_at
+   k. 删除 email_verifications 表中对应记录
+   l. 清除该用户的所有 rememberme_tokens（强制其他设备重新登录）
+   m. 记录审计日志
+7. 返回成功响应
+8. 前端跳转到登录页，显示"密码重置成功，请使用新密码登录"
+2.4.3 安全考虑
+
+1. 防用户枚举：无论邮箱是否存在，都返回相同提示
+2. Token 单次使用：使用后立即删除记录，防止重放
+3. Token 短有效期：1小时过期，减少被截获风险
+4. 强制登出：重置密码后清除所有 Remember Me Token
+5. 邮件限流：每个邮箱每小时最多 3 次请求
+6. 密码强度验证：后端再次验证，不信任前端
+7. 密码历史检查：新密码不能与最近 5 次使用过的密码相同
+8. 审计日志：记录密码重置事件，便于安全审计
+2.4.4 错误处理
+错误场景	错误码	用户提示
+邮箱格式无效	400	请输入有效的邮箱地址
+邮件发送限流	429	请求过于频繁，请稍后再试
+Token 无效	400	链接无效，请重新申请密码重置
+Token 过期	400	链接已过期，请重新申请密码重置
+Token 已使用	400	该链接已被使用，请重新申请密码重置
+新密码强度不足	400	密码必须包含至少8个字符，包括大小写字母、数字和特殊字符
+密码重复使用	400	新密码不能与最近使用过的5次密码相同
+服务器错误	500	系统错误，请稍后再试
+2.5 Remember Me 流程
+
+勾选「记住我」时：
+1. 生成长期 Remember Token（UUID）
+2. 将 SHA256(Remember Token) 存入 Manager DB rememberme_tokens 表
+3. 将 Remember Token 存入 HttpOnly Cookie（jolli.remember_me）：
+   - httpOnly: true（防止 XSS 攻击窃取）
+   - secure: true（仅 HTTPS）
+   - sameSite: 'lax'
+   - domain: '.jolli.ai'（跨子域共享）
+   - maxAge: 30 天
+4. 关闭浏览器/重启电脑后：
+   - Session Cookie 失效（session cookie 无 maxAge）
+   - 下次打开网站时，后端检测到 Remember Me Cookie
+   - 验证 SHA256(cookie_token) 与数据库中的 token_hash 匹配
+   - 验证未过期
+   - 自动创建新 Session，恢复登录状态
+5. Remember Token 访问时自动续期（滑动过期）
+2.5.1 Remember Me Cookie 设置
+
+// backend/src/auth/RememberMeService.ts
+
+function setRememberMeCookie(res: Response, token: string): void {
+  res.cookie('jolli.remember_me', token, {
+    httpOnly: true,           // 防止 JavaScript 访问，防 XSS
+    secure: process.env.NODE_ENV === 'production',  // 生产环境仅 HTTPS
+    sameSite: 'lax',          // 防 CSRF，同时允许跨子域
+    domain: '.jolli.ai',      // 跨子域共享
+    path: '/',
+    maxAge: 30 * 24 * 60 * 60 * 1000,  // 30 天（毫秒）
+  });
+}
+2.5.2 Remember Me 自动登录流程
+
+1. 用户访问 jolli.ai（或任何子域名）
+2. Session Cookie 不存在或已过期
+3. 检查 Remember Me Cookie 是否存在
+4. 如果存在：
+   a. 计算 SHA256(cookie_token)
+   b. 查询 rememberme_tokens 表匹配 token_hash
+   c. 验证记录存在且未过期
+   d. 创建新 Session，存入 Redis
+   e. 设置新的 Session Cookie
+   f. 可选：轮换 Remember Token（生成新 token，更新数据库和 Cookie）
+   g. 用户自动登录成功
+5. 如果不存在或验证失败：
+   - 重定向到登录页
+2.6 Tenant 访问流程
+
+1. 用户到达 tenant-X.jolli.ai/dashboard
+2. 浏览器自动携带 .jolli.ai 的 Cookie
+3. 服务端验证 Session 有效
+4. 服务端验证 login user 是否属于当前 Tenant（中间件层）
+5. 渲染 Dashboard
+2.7 登出流程 (Logout Flow)
+2.7.1 登出当前会话
+
+1. 用户点击「登出」按钮
+2. 前端调用 POST /api/auth/sign-out
+3. 后端处理：
+   a. 从 Cookie 中获取 Session Token
+   b. 从 Redis 验证 Session 有效性，获取 device_id
+   c. 从 Redis 删除当前 Session
+   d. 从 Tenant DB user_sessions 删除当前设备记录
+   e. 删除当前设备的 Remember Me Token（Manager DB rememberme_tokens）
+   f. 清除所有认证相关 Cookie：
+      - jolli.session_token（Session Cookie）
+      - jolli.remember_me（Remember Me Cookie）
+   g. 记录审计日志
+4. 返回成功响应
+5. 前端重定向到登录页：window.location.href = 'https://jolli.ai/login'
+2.7.2 登出所有设备
+
+场景：用户怀疑账号被盗或想在所有设备上登出
+
+1. 用户点击「登出所有设备」
+2. 前端调用 POST /api/auth/sign-out-all
+3. 后端处理：
+   a. 从 Redis 验证当前 Session 有效
+   b. 删除该用户在 Redis 的所有 Session
+   c. 删除该用户在 Tenant DB user_sessions 的所有设备记录
+   d. 删除该用户在 Manager DB 的所有 rememberme_tokens 记录
+   e. 清除当前设备的 Cookie
+   f. 记录审计日志
+4. 返回成功响应
+5. 前端重定向到登录页，显示"已在所有设备上登出"
+2.7.3 移除指定设备（新增）
+
+场景：用户在"最近登录设备"列表中发现不明设备
+
+1. 用户在设备列表中点击「移除」按钮
+2. 前端调用 DELETE /api/auth/devices/:deviceId
+3. 后端处理：
+   a. 验证当前 Session 有效
+   b. 验证 deviceId 属于当前用户
+   c. 从 Redis 删除该设备的所有 Session
+   d. 从 Tenant DB user_sessions 删除该设备记录
+   e. 记录审计日志
+4. 返回成功响应
+5. 前端刷新设备列表
+2.7.4 登出 API 端点
+方法	路径	描述
+POST	/api/auth/sign-out	登出当前会话
+POST	/api/auth/sign-out-all	登出所有设备
+GET	/api/auth/devices	获取登录设备列表
+DELETE	/api/auth/devices/:deviceId	移除指定设备
+2.7.5 GET /api/auth/devices
+请求头：
+
+
+Cookie: jolli.session_token={session_id}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  devices: [
+    {
+      device_id: "uuid",
+      device_name: "Chrome on Windows",
+      login_ip: "192.168.1.1",
+      last_active_at: "2024-01-15T10:30:00Z",
+      created_at: "2024-01-10T08:00:00Z",
+      is_current: true  // 是否为当前设备
+    }
+  ]
+}
+2.7.6 DELETE /api/auth/devices/:deviceId
+请求头：
+
+
+Cookie: jolli.session_token={session_id}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "设备已移除"
+}
+
+// 设备不存在 (404)
+{
+  success: false,
+  error: "DEVICE_NOT_FOUND",
+  message: "设备不存在"
+}
+2.7.7 POST /api/auth/sign-out
+请求头：
+
+
+Cookie: jolli.session_token={session_id}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "登出成功"
+}
+
+// 未登录 (401)
+{
+  success: false,
+  error: "NOT_AUTHENTICATED",
+  message: "未登录"
+}
+2.7.8 POST /api/auth/sign-out-all
+请求头：
+
+
+Cookie: jolli.session_token={session_id}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "已在所有设备上登出"
+}
+
+// 未登录 (401)
+{
+  success: false,
+  error: "NOT_AUTHENTICATED",
+  message: "未登录"
+}
+2.7.9 登出时的 Cookie 清除
+
+// backend/src/auth/SessionService.ts
+
+function clearAuthCookies(res: Response): void {
+  const cookieOptions = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax' as const,
+    domain: '.jolli.ai',
+    path: '/',
+  };
+
+  // 清除 Session Cookie
+  res.clearCookie('jolli.session_token', cookieOptions);
+
+  // 清除 Remember Me Cookie
+  res.clearCookie('jolli.remember_me', cookieOptions);
+}
+2.8 用户邀请流程 (Invitation Flow)
+2.8.1 邀请权限
+
+邀请权限基于组织角色：
+- org_owner: 可以邀请 admin 和 member 角色（每个组织只有一个 owner，不可邀请）
+- org_admin: 只能邀请 member 角色
+- member: 无邀请权限
+
+角色限制：
+- 每个组织有且仅有一个 owner（创建组织时自动成为 owner）
+- owner 角色不可通过邀请获得，只能通过转让
+
+邀请限制：
+- 每个组织每小时最多发送 10 封邀请邮件
+- 每个邮箱每小时最多收到 3 封邀请邮件（防止骚扰）
+2.8.2 发送邀请流程
+
+1. org_admin/owner 在组织设置页面点击「邀请成员」
+2. 填写邀请表单：
+   - Email（必填）
+   - 角色（根据邀请者权限显示可选项）：
+     - owner 邀请时：可选 admin 或 member
+     - admin 邀请时：只能选 member
+   - 自定义消息（可选，会显示在邀请邮件中）
+3. 前端调用 POST /api/auth/invite
+4. 后端处理：
+   a. 验证当前用户已登录且属于该组织（查询 Tenant DB users 表）
+   b. 验证当前用户有邀请权限（role='owner' 或 'admin'）
+   c. 验证邀请的角色是否在权限范围内
+   d. 检查被邀请邮箱是否已是该组织成员（查询 Tenant DB users 表）
+      - 如果已是成员，返回错误："该用户已是团队成员"
+   e. 检查邀请限流（Redis）：
+      - 组织限流：10 次/小时
+      - 邮箱限流：3 次/小时
+   f. 检查该邮箱是否已有待处理的邀请（查询 Tenant DB user_invitations 表）
+      - 如果有，返回错误："该邮箱已有待处理的邀请"
+   g. 检查被邀请邮箱是否已注册（查询 Manager DB org_users 表）
+      - 已注册用户：邀请 Token 中包含 user_id
+      - 未注册用户：邀请 Token 中不包含 user_id（需要先设置密码）
+   h. 生成邀请 JWT Token（type='invitation'）：
+      - email: 被邀请人邮箱
+      - org_id: 组织 ID
+      - org_name: 组织名称
+      - role: 受邀角色
+      - invited_by: 邀请人 user_id
+      - invited_by_name: 邀请人姓名
+      - user_id: 被邀请人 user_id（如果已注册）
+      - custom_message: 自定义消息（可选）
+   i. 计算 SHA256(token) 并在 Tenant DB 创建 user_invitations 记录：
+      - email, invited_by, role, token_hash
+      - status: 'pending'
+      - expires_at: 7 天后
+   j. 通过 SendGrid 发送邀请邮件
+   k. 记录邀请审计日志
+5. 返回成功响应
+6. 前端显示成功提示："邀请已发送至 xxx@example.com"
+2.8.3 接受邀请流程（已注册用户）
+
+场景：被邀请的邮箱已在系统中注册
+
+1. 用户收到邀请邮件，点击链接：https://jolli.ai/accept-invite?token={jwt_token}
+2. 前端 AcceptInvitePage 加载：
+   a. 从 URL 提取 token 参数
+   b. 调用 POST /api/auth/verify-invite-token 验证 Token 有效性
+   c. Token 无效或过期：显示错误页面
+   d. Token 有效：显示邀请信息确认页面：
+      - 邀请人姓名
+      - 组织名称
+      - 受邀角色
+      - 自定义消息（如果有）
+3. 用户确认接受邀请
+4. 前端检查用户是否已登录：
+   a. 已登录且邮箱匹配：直接调用 POST /api/auth/accept-invite
+   b. 已登录但邮箱不匹配：提示"请使用 xxx@example.com 登录后接受邀请"
+   c. 未登录：重定向到登录页，登录后自动返回邀请页面
+5. 后端处理 POST /api/auth/accept-invite：
+   a. 验证 JWT 签名
+   b. 验证 JWT 未过期（7 天有效期）
+   c. 从 JWT Token 中获取 org_id，连接对应 Tenant DB
+   d. 计算 SHA256(token) 查询 Tenant DB user_invitations 表
+   e. 验证邀请记录存在且 status='pending'
+   f. 验证当前登录用户邮箱与邀请邮箱匹配
+   g. 验证 token.type === 'invitation'
+   h. 在事务中执行以下操作：
+      1) 在 Manager DB user_orgs 表中创建关系记录：
+         - user_id: 用户 ID
+         - org_id: 组织 ID
+         - role: 受邀角色
+         - is_default: false（首次加入的组织可以设为 true）
+      2) 在 Tenant DB users 表中创建用户记录：
+         - id: 用户 ID（与 Manager DB org_users.id 一致）
+         - email: 用户邮箱（冗余存储）
+         - role: 受邀角色
+         - is_active: true
+         - display_name: 从 org_users.name 复制
+         - language: 'en'（默认）
+         - timezone: 'UTC'（默认）
+      3) 更新 Tenant DB user_invitations 记录：
+         - status: 'accepted'
+   i. 记录审计日志
+6. 返回成功响应，包含组织信息
+7. 前端跳转到该组织的 Dashboard：window.location.href = 'https://{slug}.jolli.ai/dashboard'
+2.8.4 接受邀请流程（未注册用户）
+
+场景：被邀请的邮箱尚未在系统中注册
+
+1. 用户收到邀请邮件，点击链接：https://jolli.ai/accept-invite?token={jwt_token}
+2. 前端 AcceptInvitePage 加载：
+   a. 验证 Token 有效性
+   b. Token 有效且用户未注册：显示注册 + 接受邀请表单：
+      - 显示邀请信息（邀请人、组织、角色）
+      - Name（必填）
+      - Password（必填）
+      - Confirm Password（必填）
+3. 用户填写表单并提交
+4. 前端调用 POST /api/auth/accept-invite-with-registration
+5. 后端处理：
+   a. 验证 JWT 签名和有效性
+   b. 从 JWT Token 中获取 org_id，连接对应 Tenant DB
+   c. 计算 SHA256(token) 查询 Tenant DB user_invitations 表
+   d. 验证邀请记录存在且 status='pending'
+   e. 验证 token.type === 'invitation'
+   f. 验证 token.user_id 为空（确认是未注册用户邀请）
+   g. 验证 Name 和密码强度
+   h. 在事务中执行以下操作：
+      1) 在 Manager DB 创建用户记录（org_users，is_active=true，邀请用户直接激活）
+      2) 使用 argon2id 哈希密码
+      3) 在 Manager DB 创建 org_auths 记录（provider='password'）
+      4) 在 Manager DB user_orgs 表中创建关系记录：
+         - user_id: 新创建的用户 ID
+         - org_id: 组织 ID
+         - role: 受邀角色
+         - is_default: true（新用户首个组织设为默认）
+      5) 在 Tenant DB users 表中创建用户记录：
+         - id: 新创建的用户 ID（与 Manager DB org_users.id 一致）
+         - email: 用户邮箱（冗余存储）
+         - role: 受邀角色
+         - is_active: true
+         - display_name: 从注册表单的 Name
+         - language: 'en'（默认）
+         - timezone: 'UTC'（默认）
+      6) 更新 Tenant DB user_invitations 记录：
+         - status: 'accepted'
+   i. 在 Tenant DB 创建 user_sessions 记录，生成 Session 并设置 Cookie（自动登录）
+   j. 记录审计日志
+6. 返回成功响应，包含组织信息
+7. 前端跳转到该组织的 Dashboard
+2.8.5 邀请 Token 结构
+
+interface InvitationToken {
+  jti: string;              // JWT ID
+  type: 'invitation';
+  email: string;            // 被邀请人邮箱
+  org_id: string;           // 组织 ID
+  org_name: string;         // 组织名称（用于邮件和确认页面显示）
+  role: 'admin' | 'member'; // 受邀角色（owner 不可邀请）
+  invited_by: number;       // 邀请人 user_id
+  invited_by_name: string;  // 邀请人姓名（用于邮件和确认页面显示）
+  user_id?: number;         // 被邀请人 user_id（如果已注册）
+  custom_message?: string;  // 自定义消息
+  exp: number;              // 过期时间戳（7 天）
+  iat: number;              // 签发时间戳
+}
+2.8.6 邀请相关 API 端点
+方法	路径	描述
+POST	/api/auth/invite	发送邀请邮件
+POST	/api/auth/verify-invite-token	验证邀请 Token（不消耗）
+POST	/api/auth/accept-invite	接受邀请（已登录用户）
+POST	/api/auth/accept-invite-with-registration	接受邀请并注册（未注册用户）
+POST	/api/auth/resend-invite	重新发送邀请
+DELETE	/api/auth/invite/:inviteId	撤销邀请
+GET	/api/auth/invites	获取待处理的邀请列表（租户管理）
+2.8.7 POST /api/auth/invite
+请求体：
+
+
+{
+  email: string;                          // 被邀请人邮箱
+  role: 'admin' | 'member';               // 受邀角色（owner 不可邀请）
+  orgId: string;                          // 组织 ID
+  customMessage?: string;                 // 自定义消息（可选，最多 500 字符）
+}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "邀请已发送",
+  inviteId: "uuid"  // 用于撤销邀请
+}
+
+// 无权限 (403)
+{
+  success: false,
+  error: "FORBIDDEN",
+  message: "您没有邀请成员的权限"
+}
+
+// 用户已是成员 (400)
+{
+  success: false,
+  error: "ALREADY_MEMBER",
+  message: "该用户已是团队成员"
+}
+
+// 限流 (429)
+{
+  success: false,
+  error: "RATE_LIMITED",
+  message: "邀请发送过于频繁，请稍后再试",
+  retryAfter: 3600
+}
+2.8.8 POST /api/auth/accept-invite
+请求头：
+
+
+Cookie: jolli.session_token={session_id}
+请求体：
+
+
+{
+  token: string;  // 邀请 JWT Token
+}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "已成功加入团队",
+  tenant: {
+    id: "uuid",
+    name: "Team Name",
+    slug: "team-slug"
+  }
+}
+
+// Token 无效 (400)
+{
+  success: false,
+  error: "INVALID_TOKEN" | "EXPIRED_TOKEN" | "USED_TOKEN",
+  message: "邀请链接无效/已过期/已使用"
+}
+
+// 邮箱不匹配 (403)
+{
+  success: false,
+  error: "EMAIL_MISMATCH",
+  message: "请使用 xxx@example.com 登录后接受邀请"
+}
+2.8.9 POST /api/auth/accept-invite-with-registration
+请求体：
+
+
+{
+  token: string;      // 邀请 JWT Token
+  name: string;       // 用户姓名
+  password: string;   // 密码
+}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "注册成功，已加入团队",
+  tenant: {
+    id: "uuid",
+    name: "Team Name",
+    slug: "team-slug"
+  }
+}
+
+// Token 无效 (400)
+{
+  success: false,
+  error: "INVALID_TOKEN" | "EXPIRED_TOKEN" | "USED_TOKEN",
+  message: "邀请链接无效/已过期/已使用"
+}
+
+// 用户已存在 (400)
+{
+  success: false,
+  error: "USER_EXISTS",
+  message: "该邮箱已注册，请登录后接受邀请"
+}
+
+// 密码强度不足 (400)
+{
+  success: false,
+  error: "WEAK_PASSWORD",
+  message: "密码必须包含至少8个字符，包括大小写字母、数字和特殊字符"
+}
+2.8.10 邀请邮件模板
+
+// backend/src/services/EmailTemplates.ts
+
+export const EmailTemplates = {
+  // ... 其他模板
+
+  invitation: {
+    subject: '{{invited_by_name}} 邀请您加入 {{tenant_name}}',
+    templateId: 'd-xxxxx',
+    // 动态数据：
+    // - invited_by_name: 邀请人姓名
+    // - tenant_name: 租户名称
+    // - role: 受邀角色（显示为中文：管理员/成员）
+    // - custom_message: 自定义消息（可选）
+    // - accept_url: 接受邀请链接
+    // - expires_at: 过期时间（7 天后）
+  },
+};
+2.9 邮件内容设计
+2.9.1 注册验证邮件
+邮件主题： 欢迎加入 Jolli - 请验证您的邮箱
+
+邮件内容：
+
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .container { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+    .logo { text-align: center; margin-bottom: 32px; }
+    .logo img { height: 40px; }
+    .card { background: #ffffff; border-radius: 8px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .title { font-size: 24px; font-weight: 600; color: #1a1a1a; margin-bottom: 16px; }
+    .text { font-size: 16px; color: #4a4a4a; line-height: 1.6; margin-bottom: 24px; }
+    .button { display: inline-block; background: #2563eb; color: #ffffff; padding: 14px 32px;
+              border-radius: 8px; text-decoration: none; font-weight: 500; font-size: 16px; }
+    .button:hover { background: #1d4ed8; }
+    .note { font-size: 14px; color: #6b7280; margin-top: 24px; }
+    .footer { text-align: center; margin-top: 32px; font-size: 12px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">
+      <img src="https://jolli.ai/logo.png" alt="Jolli">
+    </div>
+    <div class="card">
+      <h1 class="title">欢迎加入 Jolli！</h1>
+      <p class="text">
+        您好，{{name}}！<br><br>
+        感谢您注册 Jolli。请点击下方按钮验证您的邮箱地址并设置密码，完成账号激活。
+      </p>
+      <p style="text-align: center;">
+        <a href="{{activate_url}}" class="button">激活账号</a>
+      </p>
+      <p class="note">
+        此链接将在 24 小时后失效。如果您没有注册 Jolli 账号，请忽略此邮件。
+      </p>
+    </div>
+    <div class="footer">
+      <p>© 2024 Jolli. All rights reserved.</p>
+      <p>如果按钮无法点击，请复制以下链接到浏览器：<br>{{activate_url}}</p>
+    </div>
+  </div>
+</body>
+</html>
+动态变量：
+
+变量	说明	示例
+{{name}}	用户姓名	John Doe
+{{activate_url}}	激活链接	https://jolli.ai/activate_user?token=xxx
+2.9.2 密码重置邮件
+邮件主题： 重置您的 Jolli 密码
+
+邮件内容：
+
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    /* 同上样式 */
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">
+      <img src="https://jolli.ai/logo.png" alt="Jolli">
+    </div>
+    <div class="card">
+      <h1 class="title">重置您的密码</h1>
+      <p class="text">
+        您好，{{name}}！<br><br>
+        我们收到了重置您 Jolli 账号密码的请求。点击下方按钮设置新密码。
+      </p>
+      <p style="text-align: center;">
+        <a href="{{reset_url}}" class="button">重置密码</a>
+      </p>
+      <p class="note">
+        此链接将在 1 小时后失效。如果您没有请求重置密码，请忽略此邮件，您的账号仍然安全。
+      </p>
+    </div>
+    <div class="footer">
+      <p>© 2024 Jolli. All rights reserved.</p>
+      <p>如果按钮无法点击，请复制以下链接到浏览器：<br>{{reset_url}}</p>
+    </div>
+  </div>
+</body>
+</html>
+动态变量：
+
+变量	说明	示例
+{{name}}	用户姓名	John Doe
+{{reset_url}}	重置链接	https://jolli.ai/reset-password?token=xxx
+2.9.3 邀请邮件
+邮件主题： {{invited_by_name}} 邀请您加入 {{tenant_name}}
+
+邮件内容：
+
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    /* 同上样式 */
+    .invite-info { background: #f3f4f6; border-radius: 8px; padding: 20px; margin: 24px 0; }
+    .invite-info p { margin: 8px 0; font-size: 14px; color: #4a4a4a; }
+    .invite-info strong { color: #1a1a1a; }
+    .custom-message { background: #fef3c7; border-left: 4px solid #f59e0b;
+                      padding: 16px; margin: 24px 0; border-radius: 0 8px 8px 0; }
+    .custom-message p { margin: 0; font-size: 14px; color: #92400e; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">
+      <img src="https://jolli.ai/logo.png" alt="Jolli">
+    </div>
+    <div class="card">
+      <h1 class="title">您收到一份邀请！</h1>
+      <p class="text">
+        {{invited_by_name}} 邀请您加入 <strong>{{tenant_name}}</strong> 团队。
+      </p>
+
+      <div class="invite-info">
+        <p><strong>团队名称：</strong>{{tenant_name}}</p>
+        <p><strong>邀请人：</strong>{{invited_by_name}}</p>
+        <p><strong>您的角色：</strong>{{role_display}}</p>
+      </div>
+
+      {{#if custom_message}}
+      <div class="custom-message">
+        <p>"{{custom_message}}"</p>
+        <p style="text-align: right; margin-top: 8px;">— {{invited_by_name}}</p>
+      </div>
+      {{/if}}
+
+      <p style="text-align: center;">
+        <a href="{{accept_url}}" class="button">接受邀请</a>
+      </p>
+      <p class="note">
+        此邀请将在 7 天后失效（{{expires_at}}）。
+      </p>
+    </div>
+    <div class="footer">
+      <p>© 2024 Jolli. All rights reserved.</p>
+      <p>如果按钮无法点击，请复制以下链接到浏览器：<br>{{accept_url}}</p>
+    </div>
+  </div>
+</body>
+</html>
+动态变量：
+
+变量	说明	示例
+{{invited_by_name}}	邀请人姓名	Alice Chen
+{{tenant_name}}	团队名称	Acme Corp
+{{role_display}}	角色显示名	管理员 / 成员
+{{custom_message}}	自定义消息（可选）	欢迎加入我们的团队！
+{{accept_url}}	接受邀请链接	https://jolli.ai/accept-invite?token=xxx
+{{expires_at}}	过期时间	2024年1月25日
+2.10 页面 UI 设计
+2.10.1 登录页面 (LoginPage)
+路径： https://jolli.ai/login
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      登录到 Jolli                           |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 邮箱地址                                              |  |  |
+|  |  | [user@example.com                               ]    |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 密码                                                  |  |  |
+|  |  | [••••••••••                              ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  [✓] 记住我                          [忘记密码？]          |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                      登录                              |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  ─────────────────── 或 ───────────────────                |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | [G] 使用 Google 账号登录                              |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | [GitHub] 使用 GitHub 账号登录                         |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |           还没有账号？ [立即注册]                           |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+组件说明：
+
+元素	类型	说明
+邮箱地址	Input	type="email", 必填
+密码	Input	type="password", 带显示/隐藏切换
+记住我	Checkbox	控制 Remember Me 功能
+忘记密码	Link	跳转到 /forgot-password
+登录按钮	Button	Primary, 提交登录表单
+Google 登录	Button	OAuth 登录, 带 Google 图标
+GitHub 登录	Button	OAuth 登录, 带 GitHub 图标
+立即注册	Link	跳转到 /register
+错误状态显示：
+
+邮箱格式错误：输入框下方红色提示 "请输入有效的邮箱地址"
+密码错误：表单上方红色 Alert "邮箱或密码错误"
+账号未激活：表单上方黄色 Alert "账号未激活，请查收邮件完成激活"
+账号被锁定：表单上方红色 Alert "账号已被锁定，请 15 分钟后再试"
+2.10.2 注册页面 (RegisterPage)
+路径： https://jolli.ai/register
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      创建 Jolli 账号                        |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 姓名                                                  |  |  |
+|  |  | [John Doe                                       ]    |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 邮箱地址                                              |  |  |
+|  |  | [user@example.com                               ]    |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                      注册                              |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  ─────────────────── 或 ───────────────────                |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | [G] 使用 Google 账号注册                              |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | [GitHub] 使用 GitHub 账号注册                         |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  点击注册即表示您同意我们的 [服务条款] 和 [隐私政策]        |  |
+|  |                                                            |  |
+|  |           已有账号？ [立即登录]                             |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+注册成功页面：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      [✉️ 邮件图标]                          |  |
+|  |                                                            |  |
+|  |                    请查收验证邮件                           |  |
+|  |                                                            |  |
+|  |     我们已向 user@example.com 发送了一封验证邮件。          |  |
+|  |     请点击邮件中的链接完成账号激活。                        |  |
+|  |                                                            |  |
+|  |     没有收到邮件？                                          |  |
+|  |     • 检查垃圾邮件文件夹                                    |  |
+|  |     • [重新发送验证邮件] (60秒后可用)                       |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    返回登录                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.3 账号激活页面 (ActivateUserPage)
+路径： https://jolli.ai/activate_user?token=xxx
+
+布局设计（设置密码）：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      设置您的密码                           |  |
+|  |                                                            |  |
+|  |     您好，John！请设置密码以完成账号激活。                   |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 密码                                                  |  |  |
+|  |  | [••••••••••                              ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |     密码强度指示器:  [====----] 中等                        |  |
+|  |     ✓ 至少 8 个字符                                        |  |
+|  |     ✓ 包含大写字母                                         |  |
+|  |     ✗ 包含小写字母                                         |  |
+|  |     ✓ 包含数字                                             |  |
+|  |     ✗ 包含特殊字符                                         |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 确认密码                                              |  |  |
+|  |  | [••••••••••                              ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    激活账号                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+Token 无效/过期页面：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      [❌ 错误图标]                          |  |
+|  |                                                            |  |
+|  |                    链接已失效                               |  |
+|  |                                                            |  |
+|  |     此激活链接已过期或已被使用。                            |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                  重新发送激活邮件                      |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    返回登录                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.4 忘记密码页面 (ForgotPasswordPage)
+路径： https://jolli.ai/forgot-password
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |  [←] 返回登录                                              |  |
+|  |                                                            |  |
+|  |                      忘记密码？                             |  |
+|  |                                                            |  |
+|  |     输入您的邮箱地址，我们将发送密码重置链接。              |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 邮箱地址                                              |  |  |
+|  |  | [user@example.com                               ]    |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                  发送重置链接                          |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+发送成功页面：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      [✉️ 邮件图标]                          |  |
+|  |                                                            |  |
+|  |                    请查收邮件                               |  |
+|  |                                                            |  |
+|  |     如果 user@example.com 已注册，您将收到密码重置邮件。    |  |
+|  |                                                            |  |
+|  |     请在 1 小时内完成密码重置。                             |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    返回登录                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.5 重置密码页面 (ResetPasswordPage)
+路径： https://jolli.ai/reset-password?token=xxx
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      重置密码                               |  |
+|  |                                                            |  |
+|  |     为 user@example.com 设置新密码                         |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 新密码                                                |  |  |
+|  |  | [••••••••••                              ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |     密码强度指示器:  [========] 强                          |  |
+|  |     ✓ 至少 8 个字符                                        |  |
+|  |     ✓ 包含大写字母                                         |  |
+|  |     ✓ 包含小写字母                                         |  |
+|  |     ✓ 包含数字                                             |  |
+|  |     ✓ 包含特殊字符                                         |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 确认新密码                                            |  |  |
+|  |  | [••••••••••                              ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    重置密码                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+重置成功页面：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      [✓ 成功图标]                          |  |
+|  |                                                            |  |
+|  |                    密码重置成功                             |  |
+|  |                                                            |  |
+|  |     您的密码已成功重置。现在可以使用新密码登录。            |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    前往登录                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.6 接受邀请页面 (AcceptInvitePage)
+路径： https://jolli.ai/accept-invite?token=xxx
+
+布局设计（已注册用户）：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      您收到一份邀请                         |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |  [头像] Alice Chen 邀请您加入                         |  |  |
+|  |  |                                                      |  |  |
+|  |  |  团队: Acme Corp                                     |  |  |
+|  |  |  角色: 成员                                          |  |  |
+|  |  |                                                      |  |  |
+|  |  |  "欢迎加入我们的团队，期待与您合作！"                 |  |  |
+|  |  |                                    — Alice Chen       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    接受邀请                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    拒绝                               |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+布局设计（未注册用户 - 需要注册）：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      您收到一份邀请                         |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |  [头像] Alice Chen 邀请您加入                         |  |  |
+|  |  |                                                      |  |  |
+|  |  |  团队: Acme Corp                                     |  |  |
+|  |  |  角色: 成员                                          |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |     完成注册以加入团队                                      |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 邮箱地址 (已锁定)                                     |  |  |
+|  |  | [user@example.com                          🔒]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 姓名                                                  |  |  |
+|  |  | [                                               ]    |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 密码                                                  |  |  |
+|  |  | [                                        ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |     密码强度指示器:  [--------] 弱                          |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 确认密码                                              |  |  |
+|  |  | [                                        ] [👁]       |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                注册并加入团队                          |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.7 租户选择页面 (TenantSelectionPage)
+路径： https://jolli.ai/select-tenant
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|                           [Jolli Logo]                            |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      选择工作空间                           |  |
+|  |                                                            |  |
+|  |     欢迎回来，John！请选择要进入的工作空间。                |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |  [A] Acme Corp                                  [→]  |  |  |
+|  |  |      管理员 · 12 位成员                               |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |  [B] Beta Team                                  [→]  |  |  |
+|  |  |      成员 · 5 位成员                                  |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |  [C] Charlie's Project                          [→]  |  |  |
+|  |  |      所有者 · 3 位成员                                |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |  [+] 创建新工作空间                                   |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |                                      [登出]               |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.8 邀请成员页面 (InviteMemberPage)
+路径： https://{slug}.jolli.ai/settings/members/invite
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|  [← 返回成员管理]                                                  |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |                                                            |  |
+|  |                      邀请新成员                             |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 邮箱地址                                              |  |  |
+|  |  | [user@example.com                               ]    |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 角色                                                  |  |  |
+|  |  | [▼ 成员                                          ]    |  |  |
+|  |  |   ├─ 管理员 - 可以管理成员和设置                      |  |  |
+|  |  |   └─ 成员 - 可以访问和编辑内容                        |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  | 添加备注（可选）                                      |  |  |
+|  |  | [                                                   ]|  |  |
+|  |  | [                                                   ]|  |  |
+|  |  | [                                                   ]|  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  最多 500 字符，将显示在邀请邮件中                         |  |
+|  |                                                            |  |
+|  |  +------------------------------------------------------+  |  |
+|  |  |                    发送邀请                           |  |  |
+|  |  +------------------------------------------------------+  |  |
+|  |                                                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
++------------------------------------------------------------------+
+注意： 如果当前用户是 admin，角色下拉框只显示"成员"选项。
+
+2.10.9 待处理邀请列表页面 (PendingInvitationsPage)
+路径： https://{slug}.jolli.ai/settings/members/invitations
+
+布局设计：
+
+
++------------------------------------------------------------------+
+|  成员管理                                    [+ 邀请新成员]        |
+|                                                                   |
+|  [成员列表] [待处理邀请 (3)]                                       |
+|  ─────────────────────────────────────────────────────────────    |
+|                                                                   |
+|  +------------------------------------------------------------+  |
+|  |  邮箱                    角色      邀请时间      操作       |  |
+|  +------------------------------------------------------------+  |
+|  |  alice@example.com      管理员    2 天前       [重发] [撤销]|  |
+|  +------------------------------------------------------------+  |
+|  |  bob@example.com        成员      5 天前       [重发] [撤销]|  |
+|  |  ⚠️ 即将过期（2 天后）                                      |  |
+|  +------------------------------------------------------------+  |
+|  |  charlie@example.com    成员      1 小时前     [重发] [撤销]|  |
+|  +------------------------------------------------------------+  |
+|                                                                   |
+|  显示 1-3 共 3 条                                                 |
+|                                                                   |
++------------------------------------------------------------------+
+2.10.10 UI 组件规范
+颜色规范
+用途	颜色值	说明
+Primary	#2563eb	主要按钮、链接
+Primary Hover	#1d4ed8	主要按钮悬停
+Success	#16a34a	成功状态
+Warning	#f59e0b	警告状态
+Error	#dc2626	错误状态
+Text Primary	#1a1a1a	主要文字
+Text Secondary	#4a4a4a	次要文字
+Text Muted	#6b7280	辅助文字
+Border	#e5e7eb	边框颜色
+Background	#f9fafb	页面背景
+Card Background	#ffffff	卡片背景
+按钮样式
+类型	样式	用途
+Primary	蓝色背景，白色文字	主要操作（登录、注册、提交）
+Secondary	白色背景，灰色边框，深色文字	次要操作（取消、返回）
+Outline	透明背景，蓝色边框，蓝色文字	OAuth 按钮
+Danger	红色背景，白色文字	危险操作（删除、登出所有设备）
+Ghost	透明背景，蓝色文字	链接式按钮
+输入框样式
+
+.input {
+  height: 44px;
+  padding: 0 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  font-size: 16px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+  outline: none;
+}
+
+.input.error {
+  border-color: #dc2626;
+}
+
+.input.error:focus {
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.1);
+}
+密码强度指示器
+
+弱:     [==------] 红色
+中等:   [====----] 黄色
+强:     [======--] 浅绿色
+非常强: [========] 深绿色
+响应式断点
+断点	宽度	说明
+Mobile	< 640px	单列布局，全宽表单
+Tablet	640px - 1024px	居中卡片，最大宽度 480px
+Desktop	> 1024px	居中卡片，最大宽度 480px
+3. 数据库设计 (Manager DB)
+3.1 org_users 表
+
+CREATE TABLE org_users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT false,  -- 注册后默认未激活
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_org_users_email ON org_users(email);
+CREATE INDEX idx_org_users_is_active ON org_users(is_active);
+3.2 org_auths 表
+
+CREATE TABLE org_auths (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  provider VARCHAR(50) NOT NULL,          -- 'password' | 'google' | 'github'
+  provider_id VARCHAR(255),               -- OAuth 的 sub (password 时为 null)
+  provider_email VARCHAR(255),
+
+  -- 密码登录字段 (仅 provider='password' 时有值)
+  password_hash VARCHAR(255),
+  password_salt VARCHAR(255),
+  password_algo VARCHAR(50),              -- 'argon2id'
+  password_iterations INTEGER,
+
+  -- OAuth 登录字段 (仅 OAuth 时有值)
+  access_token TEXT,
+  refresh_token TEXT,
+  token_expires_at TIMESTAMPTZ,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE(provider, provider_id)
+);
+
+CREATE INDEX idx_org_auths_user_id ON org_auths(user_id);
+CREATE INDEX idx_org_auths_provider ON org_auths(provider);
+3.3 email_verifications 表
+
+-- 邮箱验证令牌表
+-- 设计原则: 所有信息存在 JWT token 中，数据库仅存 hash 防篡改和重放
+-- 使用后直接删除记录（而非标记 used_at）
+
+CREATE TABLE email_verifications (
+  id SERIAL PRIMARY KEY,
+  token_hash VARCHAR(255) NOT NULL,       -- SHA256(token) - 防止数据库泄露后伪造
+  expires_at TIMESTAMPTZ NOT NULL,        -- 过期时间 (冗余，JWT 中也有)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE(token_hash)
+);
+
+CREATE INDEX idx_email_verifications_token_hash ON email_verifications(token_hash);
+CREATE INDEX idx_email_verifications_expires_at ON email_verifications(expires_at);
+3.4 rememberme_tokens 表
+
+CREATE TABLE rememberme_tokens (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  token_hash VARCHAR(255) NOT NULL,       -- SHA256(token)，后端存哈希
+  user_agent VARCHAR(512),                -- 客户端 UA，风控记录
+  ip_address VARCHAR(45),                 -- 登录 IP，风控记录
+  expires_at TIMESTAMPTZ NOT NULL,        -- 过期时间 (默认 30 天)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_rememberme_tokens_user_id ON rememberme_tokens(user_id);
+CREATE INDEX idx_rememberme_tokens_token_hash ON rememberme_tokens(token_hash);
+CREATE INDEX idx_rememberme_tokens_expires_at ON rememberme_tokens(expires_at);
+3.5 password_history 表
+
+-- 密码历史表
+-- 用于检查新密码不能与最近 5 次使用过的密码相同
+
+CREATE TABLE password_history (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  password_hash VARCHAR(255) NOT NULL,    -- argon2id 哈希后的密码
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_password_history_user_id ON password_history(user_id);
+CREATE INDEX idx_password_history_created_at ON password_history(created_at);
+
+-- 注意：每个用户最多保留 5 条记录，超过时删除最旧的
+3.6 user_orgs 表 (Manager DB)
+
+-- 用户-组织关系表（Manager DB）
+-- 记录用户属于哪些组织，以及用户在该组织的角色和访问信息
+
+CREATE TABLE user_orgs (
+  id SERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES org_users(id) ON DELETE CASCADE,
+  org_id VARCHAR(255) NOT NULL,                 -- 组织 ID（字符串类型）
+  role VARCHAR(20) NOT NULL DEFAULT 'member',   -- 用户在该租户的角色：'owner' | 'admin' | 'member'
+  is_default BOOLEAN NOT NULL DEFAULT false,    -- 是否为默认租户
+  last_accessed_at TIMESTAMPTZ,                 -- 最后访问时间
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE(user_id, org_id)
+);
+
+CREATE INDEX idx_user_orgs_user_id ON user_orgs(user_id);
+CREATE INDEX idx_user_orgs_user_id_is_default ON user_orgs(user_id, is_default);
+
+-- 字段说明：
+-- role: 用户在该组织的角色，与 Tenant DB users.role 保持一致（冗余存储，便于 Manager 查询）
+-- is_default: 用户的默认租户，登录后自动跳转到该租户
+-- last_accessed_at: 最后访问时间，用于排序租户列表
+
+-- 用途：
+-- 1. 记录用户属于哪些组织（一个用户可以属于多个组织）
+-- 2. 用于登录后获取用户的租户列表
+-- 3. 记录用户在每个组织的角色（冗余存储，便于快速查询）
+-- 4. 支持默认租户和最近访问排序功能
+Tenant DB 表结构
+以下表存储在每个租户的独立数据库中
+
+3.7 users 表 (Tenant DB)
+
+-- 租户内用户表（存储在每个 Tenant 的独立数据库中）
+-- 合并了角色和个人资料，避免 JOIN
+-- id 与 Manager DB org_users.id 完全一致
+
+CREATE TABLE users (
+  id BIGINT PRIMARY KEY,                        -- 与 Manager DB org_users.id 一致
+  email VARCHAR(255) NOT NULL,                  -- 冗余字段，方便查询
+  role VARCHAR(20) NOT NULL DEFAULT 'member',   -- 'owner' | 'admin' | 'member'
+  is_active BOOLEAN NOT NULL DEFAULT true,      -- 租户内停用状态
+
+  -- 个人资料（直接合并，避免 JOIN）
+  nickname VARCHAR(100),
+  first_name VARCHAR(100),
+  last_name VARCHAR(100),
+  display_name VARCHAR(255),
+  avatar VARCHAR(512),
+  job_title VARCHAR(100),
+  phone VARCHAR(50),
+  language VARCHAR(10) DEFAULT 'en',            -- 默认 'en'
+  timezone VARCHAR(50) DEFAULT 'UTC',           -- 默认 'UTC'
+  location VARCHAR(255),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_role ON users(role);
+CREATE INDEX idx_users_is_active ON users(is_active);
+
+-- 角色说明：
+-- owner: 组织所有者，每个组织有且仅有一个，可以邀请 admin 和 member
+-- admin: 管理员，只能邀请 member
+-- member: 普通成员，无邀请权限
+
+-- 设计说明：
+-- 1. 每个 Tenant 有独立的数据库，users 表存储该租户的成员
+-- 2. id 直接使用 Manager DB org_users.id，无需额外映射
+-- 3. email 冗余存储，方便租户内查询，无需跨库查询
+-- 4. 个人资料直接内嵌，避免额外的 JOIN 操作
+-- 5. is_active 用于租户内停用用户（不影响其他租户）
+3.8 user_sessions 表 (Tenant DB)
+
+-- 用户会话记录表（存储在每个 Tenant 的独立数据库中）
+-- 用于显示"最近登录设备"和支持"移除不明设备"功能
+-- 注意：Session 验证通过 Redis 进行，此表仅用于设备管理和审计
+
+CREATE TABLE user_sessions (
+  id SERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_id VARCHAR(255),                       -- 前端生成的设备 UUID
+  device_name VARCHAR(200),                     -- "iPhone 13" | "Chrome on Windows"
+  user_agent TEXT,                              -- 完整的 User-Agent 字符串
+  login_ip VARCHAR(45),                         -- 登录 IP
+  last_active_at TIMESTAMPTZ NOT NULL,          -- 最后活跃时间
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE(user_id, device_id)
+);
+
+CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id, last_active_at DESC);
+
+-- 用途：
+-- 1. 显示"最近登录设备"列表
+-- 2. 支持"移除不明设备"功能（踢出其他设备的登录）
+-- 3. 安全审计（记录用户登录历史）
+
+-- 设计说明：
+-- 1. 每个设备由 device_id（前端生成的 UUID）唯一标识
+-- 2. device_name 由前端解析 User-Agent 或用户自定义
+-- 3. last_active_at 用于显示最后活跃时间，定期更新
+-- 4. Session 验证不依赖此表，而是通过 Redis 进行
+3.9 user_invitations 表 (Tenant DB)
+
+-- 用户邀请记录表（存储在每个 Tenant 的独立数据库中）
+-- 记录邀请状态（待处理、已接受、已过期）
+
+CREATE TABLE user_invitations (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  invited_by BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- 邀请人
+  role VARCHAR(20) NOT NULL DEFAULT 'member',  -- 受邀角色：'admin' | 'member'
+  token_hash VARCHAR(255) NOT NULL,            -- SHA256(token)，用于验证
+  expires_at TIMESTAMPTZ NOT NULL,             -- 过期时间，默认 7 天
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- 'pending' | 'accepted' | 'expired'
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_invitations_email ON user_invitations(email);
+CREATE INDEX idx_user_invitations_expires_at_status ON user_invitations(expires_at, status);
+
+-- 状态说明：
+-- pending: 待处理（等待用户接受）
+-- accepted: 已接受（用户已加入组织）
+-- expired: 已过期（超过有效期未处理）
+
+-- 设计说明：
+-- 1. 邀请存储在 Tenant DB，每个租户独立管理邀请
+-- 2. invited_by 引用 Tenant DB 的 users 表
+-- 3. 撤销邀请直接删除记录（或标记为 expired）
+4. 邮件验证 Token 设计
+4.1 Token 结构 (JWT Payload)
+
+interface EmailVerificationToken {
+  jti: string;              // JWT ID (对应 DB 的 id，防止重放)
+  type: 'registration' | 'password_reset' | 'invitation' | 'email_change';
+  email: string;            // 待验证的邮箱
+  user_id?: number;         // 用户 ID (password_reset 时有值，registration 时为空)
+  org_id?: string;          // 组织 ID (invitation 时有值)
+  invited_by?: number;      // 邀请人 ID (invitation 时有值)
+  role?: string;            // 受邀角色 (invitation 时有值)
+  exp: number;              // 过期时间戳
+  iat: number;              // 签发时间戳
+}
+4.2 Token 过期时间
+Token 类型	过期时间
+registration	24 小时
+password_reset	1 小时
+invitation	7 天
+email_change	1 小时
+4.3 Token 工作流程
+
+// 1. 生成 token
+async function generateVerificationToken(payload: Omit<EmailVerificationToken, 'jti' | 'iat'>): Promise<string> {
+  const jti = crypto.randomUUID();
+  const token = jwt.sign({ ...payload, jti }, EMAIL_TOKEN_SECRET, { expiresIn: payload.exp });
+
+  // 存储 hash 到数据库
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await emailVerificationDao.create({
+    tokenHash,
+    expiresAt: new Date(payload.exp * 1000),
+  });
+
+  return token;
+}
+
+// 2. 验证 token
+async function verifyToken(token: string): Promise<EmailVerificationToken | null> {
+  // 验证 JWT 签名
+  const payload = jwt.verify(token, EMAIL_TOKEN_SECRET) as EmailVerificationToken;
+
+  // 计算 hash 查询数据库
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const record = await emailVerificationDao.findByTokenHash(tokenHash);
+
+  if (!record || record.usedAt !== null) {
+    return null; // Token 不存在或已使用
+  }
+
+  // 标记为已使用
+  await emailVerificationDao.markAsUsed(record.id);
+
+  return payload;
+}
+5. 邮件服务设计 (SendGrid)
+5.1 邮件类型
+邮件类型	用途	限流
+verification	注册邮箱验证	5 次/小时
+password_reset	密码重置	3 次/小时
+invitation	租户邀请	3 次/小时
+5.2 邮件模板
+
+// backend/src/services/EmailTemplates.ts
+
+export const EmailTemplates = {
+  verification: {
+    subject: 'Welcome to Jolli - Verify Your Email',
+    templateId: 'd-xxxxx', // SendGrid Dynamic Template ID
+  },
+  password_reset: {
+    subject: 'Reset Your Jolli Password',
+    templateId: 'd-xxxxx',
+  },
+  invitation: {
+    subject: 'You\'ve Been Invited to Join {{tenant_name}} on Jolli',
+    templateId: 'd-xxxxx',
+  },
+};
+5.3 邮件链接
+邮件类型	链接格式
+verification	https://jolli.ai/activate_user?token={jwt_token}
+password_reset	https://jolli.ai/reset-password?token={jwt_token}
+invitation	https://jolli.ai/accept-invite?token={jwt_token}
+6. Redis 设计
+6.1 Redis Key 命名规范
+文件位置：backend/src/services/RedisKeys.ts
+
+
+export const RedisKeys = {
+  // 会话存储
+  session: (sessionId: string) => `session:${sessionId}`,
+
+  // 账户锁定
+  loginAttempts: (identifier: string) => `login:attempts:${identifier}`,
+  loginLocked: (identifier: string) => `login:locked:${identifier}`,
+
+  // 邮件限流
+  emailSent: (email: string, type: string) => `email:sent:${type}:${email}`,
+
+  // 邀请限流
+  inviteCount: (orgId: string) => `invite:count:${orgId}`,
+
+  // 组织配置
+  orgConfig: (orgId: string) => `org:config:${orgId}`,
+
+  // 分布式锁
+  lock: (resource: string, id: string) => `lock:${resource}:${id}`,
+};
+6.2 邮件限流实现
+
+// backend/src/services/EmailRateLimiter.ts
+
+const EMAIL_RATE_LIMITS: Record<string, number> = {
+  invitation: 3,      // 邀请邮件: 3 次/小时
+  password_reset: 3,  // 密码重置: 3 次/小时
+  verification: 5,    // 邮箱验证: 5 次/小时
+};
+
+async function checkEmailRateLimit(email: string, type: string): Promise<boolean> {
+  const key = RedisKeys.emailSent(email, type);
+  const count = await redis.incr(key);
+
+  if (count === 1) {
+    await redis.expire(key, 3600); // 1 小时过期
+  }
+
+  const limit = EMAIL_RATE_LIMITS[type] ?? 5;
+  return count <= limit;
+}
+6.3 Session 存储（Redis + Tenant DB 混合方案）
+
+架构设计：
+- Redis: 存储 Session Token，用于快速验证（高性能）
+- Tenant DB user_sessions: 存储设备记录，用于"最近登录设备"显示和"移除设备"功能
+
+流程：
+1. 登录时：
+   - 在 Redis 中创建 Session（用于验证）
+   - 在 Tenant DB user_sessions 中记录设备信息（用于设备管理）
+2. 请求验证时：
+   - 仅查询 Redis（高性能）
+3. 显示"最近登录设备"时：
+   - 查询 Tenant DB user_sessions
+4. "移除设备"时：
+   - 删除 Redis 中对应的 Session
+   - 删除 Tenant DB user_sessions 中的记录
+
+// Redis Session 数据结构
+interface RedisSessionData {
+  user_id: number;
+  org_id: string;           // 当前租户 ID
+  email: string;
+  device_id: string;        // 关联到 Tenant DB user_sessions
+  created_at: number;
+  expires_at: number;
+}
+
+// Redis Key 命名
+const RedisKeys = {
+  session: (token: string) => `session:${token}`,
+  userSessions: (userId: number) => `user:${userId}:sessions`,  // Set of session tokens
+};
+
+// 登录成功后创建 Session
+async function createSession(
+  redis: Redis,
+  tenantDb: TenantDatabase,
+  userId: number,
+  orgId: string,
+  email: string,
+  req: Request
+): Promise<string> {
+  const sessionToken = crypto.randomUUID();
+  const deviceId = req.headers['x-device-id'] || crypto.randomUUID();
+  const deviceName = parseDeviceName(req.headers['user-agent']);
+  const expiresAt = Date.now() + 7 * 24 * 3600 * 1000;  // 7 天
+
+  // 1. 存入 Redis（用于快速验证）
+  const sessionData: RedisSessionData = {
+    user_id: userId,
+    org_id: orgId,
+    email,
+    device_id: deviceId,
+    created_at: Date.now(),
+    expires_at: expiresAt,
+  };
+  await redis.setex(
+    RedisKeys.session(sessionToken),
+    7 * 24 * 3600,
+    JSON.stringify(sessionData)
+  );
+  await redis.sadd(RedisKeys.userSessions(userId), sessionToken);
+
+  // 2. 记录到 Tenant DB（用于设备管理）
+  await tenantDb.userSessions.upsert({
+    user_id: userId,
+    device_id: deviceId,
+    device_name: deviceName,
+    user_agent: req.headers['user-agent'] || '',
+    login_ip: req.ip || '',
+    last_active_at: new Date(),
+  });
+
+  return sessionToken;
+}
+
+// 验证 Session（仅查 Redis，高性能）
+async function validateSession(
+  redis: Redis,
+  sessionToken: string
+): Promise<RedisSessionData | null> {
+  const data = await redis.get(RedisKeys.session(sessionToken));
+  if (!data) return null;
+
+  const session = JSON.parse(data) as RedisSessionData;
+  if (session.expires_at < Date.now()) {
+    await redis.del(RedisKeys.session(sessionToken));
+    return null;
+  }
+
+  return session;
+}
+
+// 登出当前设备
+async function logoutCurrentDevice(
+  redis: Redis,
+  tenantDb: TenantDatabase,
+  sessionToken: string,
+  userId: number,
+  deviceId: string
+): Promise<void> {
+  // 删除 Redis Session
+  await redis.del(RedisKeys.session(sessionToken));
+  await redis.srem(RedisKeys.userSessions(userId), sessionToken);
+
+  // 删除 Tenant DB 设备记录
+  await tenantDb.userSessions.destroy({
+    where: { user_id: userId, device_id: deviceId }
+  });
+}
+
+// 移除指定设备（用于"移除不明设备"功能）
+async function removeDevice(
+  redis: Redis,
+  tenantDb: TenantDatabase,
+  userId: number,
+  deviceId: string
+): Promise<void> {
+  // 查找并删除该设备的所有 Redis Session
+  const sessionTokens = await redis.smembers(RedisKeys.userSessions(userId));
+  for (const token of sessionTokens) {
+    const data = await redis.get(RedisKeys.session(token));
+    if (data) {
+      const session = JSON.parse(data) as RedisSessionData;
+      if (session.device_id === deviceId) {
+        await redis.del(RedisKeys.session(token));
+        await redis.srem(RedisKeys.userSessions(userId), token);
+      }
+    }
+  }
+
+  // 删除 Tenant DB 设备记录
+  await tenantDb.userSessions.destroy({
+    where: { user_id: userId, device_id: deviceId }
+  });
+}
+
+// 获取用户的登录设备列表（用于"最近登录设备"显示）
+async function getUserDevices(
+  tenantDb: TenantDatabase,
+  userId: number
+): Promise<UserSession[]> {
+  return await tenantDb.userSessions.findAll({
+    where: { user_id: userId },
+    order: [['last_active_at', 'DESC']]
+  });
+}
+
+// 登出所有设备
+async function logoutAllDevices(
+  redis: Redis,
+  tenantDb: TenantDatabase,
+  userId: number
+): Promise<void> {
+  // 删除 Redis 中所有 Session
+  const sessionTokens = await redis.smembers(RedisKeys.userSessions(userId));
+  if (sessionTokens.length > 0) {
+    await redis.del(...sessionTokens.map(t => RedisKeys.session(t)));
+  }
+  await redis.del(RedisKeys.userSessions(userId));
+
+  // 删除 Tenant DB 中所有设备记录
+  await tenantDb.userSessions.destroy({
+    where: { user_id: userId }
+  });
+}
+7. 安全策略
+7.1 暴力破解保护
+
+// 渐进式惩罚策略
+// - 3 次失败 -> 强制 CAPTCHA (不锁定)
+// - 5 次失败 -> 锁定 15 分钟
+// - 10 次失败 -> 锁定 1 小时
+// - 20 次失败 -> 锁定 24 小时
+
+// 多维度防护
+await checkLoginAttempts(`ip:${req.ip}`);      // 防止 IP 枚举多账号
+await checkLoginAttempts(`email:${email}`);    // 防止暴力破解单账号
+7.2 Cookie 策略
+系统使用两种认证 Cookie，均设置 HttpOnly 防止 XSS 攻击：
+
+Cookie 名称	用途	HttpOnly	Secure	MaxAge
+jolli.session_token	Session ID	✓	✓	无（会话级）
+jolli.remember_me	Remember Me Token	✓	✓	30 天
+
+// Session Cookie（会话级，关闭浏览器失效）
+const sessionCookieOptions = {
+  httpOnly: true,           // 防止 JavaScript 访问，防 XSS
+  secure: true,             // 生产环境必须 HTTPS
+  sameSite: 'lax',          // 允许跨子域但防止 CSRF
+  domain: '.jolli.ai',      // 根域名，跨子域共享
+  path: '/',
+  // 不设置 maxAge，浏览器关闭时 Cookie 失效
+};
+
+// Remember Me Cookie（持久化，30 天有效）
+const rememberMeCookieOptions = {
+  httpOnly: true,           // 防止 JavaScript 访问，防 XSS
+  secure: true,             // 生产环境必须 HTTPS
+  sameSite: 'lax',          // 允许跨子域但防止 CSRF
+  domain: '.jolli.ai',      // 根域名，跨子域共享
+  path: '/',
+  maxAge: 30 * 24 * 60 * 60 * 1000,  // 30 天（毫秒）
+};
+安全说明：
+
+httpOnly: true：Cookie 无法通过 JavaScript 访问（如 document.cookie），防止 XSS 攻击窃取认证信息
+secure: true：Cookie 仅通过 HTTPS 传输，防止中间人攻击
+sameSite: 'lax'：防止 CSRF 攻击，同时允许跨子域名共享
+Session Cookie 不设置 maxAge，确保浏览器关闭时自动清除
+Remember Me Cookie 设置 30 天有效期，用于持久化登录
+7.3 Argon2id 参数
+
+{
+  type: argon2.argon2id,
+  memoryCost: 65536,      // 64 MiB
+  timeCost: 3,
+  parallelism: 4,
+}
+7.4 密码要求
+最少 8 字符
+至少一个大写字母
+至少一个小写字母
+至少一个数字
+至少一个特殊字符
+不能与最近 5 次使用过的密码相同
+7.5 Token 安全
+所有验证 Token 使用 JWT 签名（HS256）
+数据库仅存储 SHA256(token)，防止数据库泄露后伪造
+Token 使用后立即删除记录，防止重放攻击
+定期清理过期的 email_verifications 记录
+8. 重定向逻辑
+
+// 登录成功后获取用户的租户列表
+// 优先级：1. 默认租户(is_default=true) 2. 最近访问(last_accessed_at DESC) 3. 创建时间(created_at DESC)
+const userOrgs = await userOrgDao.findByUserId(userId, {
+  orderBy: [
+    { is_default: 'DESC' },
+    { last_accessed_at: 'DESC NULLS LAST' },
+    { created_at: 'DESC' }
+  ]
+});
+
+if (userOrgs.length === 0) {
+  // 无租户，显示提示页
+  redirect('https://jolli.ai/welcome-new');
+} else if (userOrgs.length === 1) {
+  // 自动跳转到唯一租户
+  redirect(`https://${userOrgs[0].slug}.jolli.ai/dashboard`);
+} else {
+  // 检查是否有默认租户
+  const defaultOrg = userOrgs.find(org => org.is_default);
+  if (defaultOrg) {
+    // 自动跳转到默认租户
+    redirect(`https://${defaultOrg.slug}.jolli.ai/dashboard`);
+  } else {
+    // 跳转到租户选择页（按最近访问排序显示）
+    redirect('https://jolli.ai/select-tenant');
+  }
+}
+
+// 访问租户时更新 last_accessed_at
+async function updateLastAccessed(userId: number, orgId: string) {
+  await userOrgDao.update(
+    { last_accessed_at: new Date() },
+    { where: { user_id: userId, org_id: orgId } }
+  );
+}
+9. 新增文件
+9.1 Backend 新文件
+文件路径	用途
+backend/src/auth/auth.ts	better-auth 核心配置（OAuth + 密码认证）
+backend/src/auth/auth-handler.ts	better-auth Express handler
+backend/src/services/RedisService.ts	Redis 连接管理、Key 操作
+backend/src/services/RedisKeys.ts	Redis Key 命名规范
+backend/src/services/EmailService.ts	SendGrid 邮件发送服务
+backend/src/services/EmailRateLimiter.ts	邮件发送限流
+backend/src/services/EmailTemplates.ts	邮件模板定义
+backend/src/util/PasswordUtil.ts	argon2id 哈希、验证
+backend/src/util/EmailTokenUtil.ts	邮件验证 Token 生成和验证
+backend/src/auth/BruteForceProtection.ts	暴力破解保护
+backend/src/auth/RememberMeService.ts	Remember Me 令牌管理
+backend/src/auth/TenantSelectionService.ts	租户选择逻辑
+backend/src/auth/LogoutService.ts	登出服务
+9.2 Manager DB 新文件
+文件路径	用途
+manager/src/lib/db/models/OrgUserModel.ts	用户模型
+manager/src/lib/db/models/OrgAuthModel.ts	认证方式模型
+manager/src/lib/db/models/EmailVerificationModel.ts	邮件验证 Token 模型
+manager/src/lib/db/models/RememberMeTokenModel.ts	Remember Me 令牌模型
+manager/src/lib/db/models/PasswordHistoryModel.ts	密码历史模型
+manager/src/lib/db/models/UserOrgModel.ts	用户-组织关系模型
+manager/src/lib/db/dao/OrgUserDao.ts	用户 DAO
+manager/src/lib/db/dao/OrgAuthDao.ts	认证方式 DAO
+manager/src/lib/db/dao/EmailVerificationDao.ts	邮件验证 Token DAO
+manager/src/lib/db/dao/RememberMeTokenDao.ts	Remember Me 令牌 DAO
+manager/src/lib/db/dao/PasswordHistoryDao.ts	密码历史 DAO
+manager/src/lib/db/dao/UserOrgDao.ts	用户-组织关系 DAO
+manager/src/lib/services/PasswordHistoryService.ts	密码历史检查服务
+9.3 Tenant DB 新文件（Backend）
+文件路径	用途
+backend/src/model/User.ts	Tenant 用户模型（角色+资料）
+backend/src/model/UserSession.ts	Tenant 用户会话模型
+backend/src/model/UserInvitation.ts	Tenant 用户邀请模型
+backend/src/dao/UserDao.ts	Tenant 用户 DAO
+backend/src/dao/UserSessionDao.ts	Tenant 用户会话 DAO
+backend/src/dao/UserInvitationDao.ts	Tenant 用户邀请 DAO
+backend/src/services/TenantUserService.ts	Tenant 用户服务（创建、更新、停用）
+backend/src/services/TenantSessionService.ts	Tenant 会话服务
+backend/src/services/TenantInvitationService.ts	Tenant 邀请服务
+9.4 Frontend 新文件
+文件路径	用途
+frontend/src/lib/auth-client.ts	better-auth 前端客户端配置
+frontend/src/ui/auth/LoginPage.tsx	登录页面
+frontend/src/ui/auth/RegisterPage.tsx	注册页面
+frontend/src/ui/auth/ActivateUserPage.tsx	账号激活页面
+frontend/src/ui/auth/ForgotPasswordPage.tsx	忘记密码页面
+frontend/src/ui/auth/ResetPasswordPage.tsx	重置密码页面
+frontend/src/ui/auth/OAuthCallbackPage.tsx	OAuth 回调处理页面
+frontend/src/ui/auth/TenantSelectionPage.tsx	租户选择页面
+frontend/src/ui/auth/AcceptInvitePage.tsx	接受邀请页面
+frontend/src/ui/auth/AccountSettingsPage.tsx	账号设置（关联/解除 OAuth）
+frontend/src/ui/auth/InviteMemberPage.tsx	邀请成员页面（租户设置内）
+frontend/src/ui/auth/PendingInvitationsPage.tsx	待处理邀请列表页面
+10. 修改现有文件
+10.1 Backend 修改
+文件路径	修改内容
+backend/src/config/Config.ts	添加 Redis、SendGrid、better-auth、OAuth 配置
+backend/src/AppFactory.ts	初始化 Redis、挂载 better-auth handler、移除 Grant 配置
+backend/src/util/Cookies.ts	添加 RememberMe Cookie 方法（better-auth 处理主要 Cookie）
+10.2 Backend 移除/废弃文件
+文件路径	说明
+backend/src/auth/AuthProvider.ts	移除 - 被 better-auth OAuth 替代
+backend/src/auth/GoogleAuthProvider.ts	移除 - 被 better-auth socialProviders.google 替代
+backend/src/auth/GitHubAuthProvider.ts	移除 - 被 better-auth socialProviders.github 替代
+backend/src/auth/AuthGateway.ts	移除 - better-auth 内置处理 OAuth 网关
+backend/src/auth/AuthCodeService.ts	保留 - 用于邮件验证 Token（非 OAuth）
+backend/src/router/AuthRouter.ts	重构 - 移除 Grant 相关代码，保留租户选择逻辑
+backend/src/util/AuthHandler.ts	重构 - 使用 better-auth session 验证
+Grant 配置 (AppFactory.ts)	移除 - Grant 库不再使用
+10.3 Frontend 修改
+文件路径	修改内容
+frontend/src/ui/AuthElement.tsx	重构 - 使用 better-auth 客户端，支持密码和 OAuth
+common/src/core/AuthClient.ts	移除 - 使用 better-auth/react 客户端替代
+frontend/src/App.tsx	添加新页面路由
+10.4 依赖变更
+添加：
+
+
+{
+  "better-auth": "^1.x.x",
+  "@better-auth/react": "^1.x.x",
+  "ioredis": "^5.x.x",
+  "argon2": "^0.x.x",
+  "@sendgrid/mail": "^8.x.x"
+}
+移除：
+
+
+{
+  "grant": "移除 - 被 better-auth 替代"
+}
+11. API 端点设计
+11.1 注册和激活端点
+方法	路径	描述
+POST	/api/auth/register	用户注册（发送验证邮件）
+POST	/api/auth/activate	激活账号（验证 Token）
+POST	/api/auth/resend-verification	重新发送验证邮件
+11.2 登录相关端点（better-auth 内置）
+方法	路径	描述
+POST	/api/auth/sign-in/email	邮箱密码登录
+POST	/api/auth/sign-out	登出当前会话
+POST	/api/auth/sign-out-all	登出所有设备
+GET	/api/auth/session	获取当前会话
+POST	/api/auth/change-password	修改密码（已登录）
+11.3 OAuth 端点（better-auth 内置）
+方法	路径	描述
+GET	/api/auth/sign-in/social?provider=google	发起 Google OAuth
+GET	/api/auth/sign-in/social?provider=github	发起 GitHub OAuth
+GET	/api/auth/callback/google	Google OAuth 回调
+GET	/api/auth/callback/github	GitHub OAuth 回调
+POST	/api/auth/link-account	关联 OAuth 账号（已登录）
+POST	/api/auth/unlink-account	解除 OAuth 关联（已登录）
+GET	/api/auth/list-accounts	获取已关联的账号列表
+11.4 忘记密码/密码重置端点
+方法	路径	描述
+POST	/api/auth/forgot-password	发起密码重置（发送邮件）
+POST	/api/auth/verify-reset-token	验证重置 Token 有效性（不消耗）
+POST	/api/auth/reset-password	执行密码重置（消耗 Token）
+11.4.1 POST /api/auth/forgot-password
+请求体：
+
+
+{
+  email: string;  // 用户邮箱
+}
+响应：
+
+
+// 成功 (200) - 无论邮箱是否存在都返回相同响应
+{
+  success: true,
+  message: "如果该邮箱已注册，您将收到一封密码重置邮件"
+}
+
+// 限流 (429)
+{
+  success: false,
+  error: "RATE_LIMITED",
+  message: "请求过于频繁，请稍后再试",
+  retryAfter: 3600  // 重试等待秒数
+}
+11.4.2 POST /api/auth/verify-reset-token
+请求体：
+
+
+{
+  token: string;  // JWT Token
+}
+响应：
+
+
+// 有效 (200)
+{
+  valid: true,
+  email: "user@example.com"  // 用于前端显示
+}
+
+// 无效 (400)
+{
+  valid: false,
+  error: "INVALID_TOKEN" | "EXPIRED_TOKEN" | "USED_TOKEN",
+  message: "链接无效/已过期/已使用"
+}
+11.4.3 POST /api/auth/reset-password
+请求体：
+
+
+{
+  token: string;      // JWT Token
+  password: string;   // 新密码
+}
+响应：
+
+
+// 成功 (200)
+{
+  success: true,
+  message: "密码重置成功，请使用新密码登录"
+}
+
+// Token 无效 (400)
+{
+  success: false,
+  error: "INVALID_TOKEN" | "EXPIRED_TOKEN" | "USED_TOKEN",
+  message: "链接无效/已过期/已使用"
+}
+
+// 密码强度不足 (400)
+{
+  success: false,
+  error: "WEAK_PASSWORD",
+  message: "密码必须包含至少12个字符，包括大小写字母、数字和特殊字符"
+}
+11.5 租户相关端点
+方法	路径	描述
+GET	/api/auth/tenants	获取用户租户列表
+POST	/api/auth/select-tenant	选择租户并获取重定向 URL
+11.6 邀请相关端点
+方法	路径	描述
+POST	/api/auth/invite	发送邀请邮件
+POST	/api/auth/verify-invite-token	验证邀请 Token（不消耗）
+POST	/api/auth/accept-invite	接受邀请（已登录用户）
+POST	/api/auth/accept-invite-with-registration	接受邀请并注册（未注册用户）
+POST	/api/auth/resend-invite	重新发送邀请
+DELETE	/api/auth/invite/:inviteId	撤销邀请
+GET	/api/auth/invites	获取待处理的邀请列表
+12. 环境变量
+
+# Redis 配置
+REDIS_URL=redis://localhost:6379
+REDIS_PASSWORD=
+REDIS_TLS_ENABLED=false
+
+# SendGrid 配置
+SENDGRID_API_KEY=SG.xxxxx
+SENDGRID_FROM_EMAIL=noreply@jolli.ai
+SENDGRID_FROM_NAME=Jolli
+
+# 邮件 Token
+EMAIL_TOKEN_SECRET=<32-byte-secret>
+EMAIL_VERIFICATION_EXPIRY_HOURS=24
+EMAIL_PASSWORD_RESET_EXPIRY_HOURS=1
+EMAIL_INVITATION_EXPIRY_DAYS=7
+
+# 密码认证
+PASSWORD_AUTH_ENABLED=true
+PASSWORD_MIN_LENGTH=8
+PASSWORD_REQUIRE_SPECIAL=true
+PASSWORD_REQUIRE_NUMBER=true
+PASSWORD_REQUIRE_UPPERCASE=true
+PASSWORD_HISTORY_COUNT=5
+
+# better-auth
+BETTER_AUTH_SECRET=<32-byte-secret>
+BETTER_AUTH_URL=https://jolli.ai
+
+# Remember Me
+REMEMBER_ME_ENABLED=true
+REMEMBER_ME_DURATION_DAYS=30
+
+# 暴力破解保护
+BRUTE_FORCE_CAPTCHA_THRESHOLD=3
+BRUTE_FORCE_LOCK_15M_THRESHOLD=5
+BRUTE_FORCE_LOCK_1H_THRESHOLD=10
+BRUTE_FORCE_LOCK_24H_THRESHOLD=20
+
+# 邮件限流
+EMAIL_RATE_LIMIT_VERIFICATION=5
+EMAIL_RATE_LIMIT_PASSWORD_RESET=3
+EMAIL_RATE_LIMIT_INVITATION=3
+13. 实施步骤
+Phase 1: 基础设施
+添加 npm 依赖 (better-auth, ioredis, argon2, @sendgrid/mail)
+创建 RedisService
+创建 Manager DB 迁移（包含 email_verifications 表）
+创建 Manager DAOs
+Phase 2: 邮件服务
+创建 EmailService (SendGrid)
+创建 EmailRateLimiter
+创建 EmailTokenUtil
+配置 SendGrid 动态模板
+Phase 3: 注册激活
+创建注册 API 端点
+创建激活 API 端点
+创建 RegisterPage.tsx
+创建 ActivateUserPage.tsx
+Phase 4: better-auth 核心配置
+创建 backend/src/auth/auth.ts - better-auth 配置
+创建 backend/src/auth/auth-handler.ts - Express handler
+配置 OAuth 提供商（Google、GitHub）
+配置跨域 Cookie（.jolli.ai）
+Phase 5: 密码认证
+创建 PasswordUtil（argon2id）
+配置 better-auth emailAndPassword
+更新 Cookies.ts
+Phase 6: 安全功能
+创建 BruteForceProtection
+创建 RememberMeService
+重构 AuthHandler.ts（使用 better-auth session）
+Phase 7: 移除旧 OAuth 实现
+移除 Grant 库配置
+移除 AuthProvider.ts、GoogleAuthProvider.ts、GitHubAuthProvider.ts
+移除 AuthGateway.ts
+重构 AuthRouter.ts（保留租户选择，移除 Grant 相关）
+Phase 8: 登出功能
+创建 LogoutService
+实现 POST /api/auth/sign-out 端点
+实现 POST /api/auth/sign-out-all 端点
+Phase 9: 租户选择
+创建 TenantSelectionService
+Phase 10: Tenant DB 表结构
+创建 Tenant DB 迁移（users、user_sessions、user_invitations 表）
+创建 User Model (Backend/Tenant)
+创建 UserSession Model (Backend/Tenant)
+创建 UserInvitation Model (Backend/Tenant)
+创建 UserDao (Backend/Tenant)
+创建 UserSessionDao (Backend/Tenant)
+创建 UserInvitationDao (Backend/Tenant)
+创建 TenantUserService (Backend)
+创建 TenantSessionService (Backend)
+创建 TenantInvitationService (Backend)
+Phase 11: Manager DB user_orgs 表
+创建 Manager DB 迁移（user_orgs 表）
+创建 UserOrgModel (Manager)
+创建 UserOrgDao (Manager)
+Phase 12: 用户邀请功能
+实现邀请相关 API 端点
+创建 InviteMemberPage.tsx
+创建 AcceptInvitePage.tsx
+创建 PendingInvitationsPage.tsx
+Phase 13: 前端
+创建 frontend/src/lib/auth-client.ts - better-auth 客户端
+创建 LoginPage.tsx
+创建 OAuthCallbackPage.tsx
+创建 ForgotPasswordPage.tsx
+创建 ResetPasswordPage.tsx
+创建 TenantSelectionPage.tsx
+创建 AccountSettingsPage.tsx（OAuth 关联管理）
+重构 AuthElement.tsx（使用 better-auth）
+Phase 14: 测试和完善
+编写单元测试和集成测试
+安全审计
+更新文档
+14. 验证方案
+14.1 功能测试
+测试用户注册流程（填写表单 -> 收到邮件 -> 点击激活 -> 登录）
+测试邮件限流（超过限制时返回错误）
+测试 Token 防重放（使用过的 Token 无法再次使用）
+测试邮箱密码登录
+测试 OAuth 登录（Google、GitHub - better-auth）：
+Google OAuth 登录流程
+GitHub OAuth 登录流程
+OAuth 用户自动激活（is_active=true）
+OAuth 登录后获取 tenants 列表
+跨子域名 Cookie 共享
+测试 OAuth 账号关联：
+已登录用户关联 Google/GitHub 账号
+解除 OAuth 关联
+查看已关联账号列表
+测试 OAuth 邮箱冲突处理：
+自动关联模式测试
+拒绝登录模式测试
+测试 Remember Me 功能
+测试租户选择流程
+测试暴力破解保护
+测试忘记密码流程：
+发起密码重置请求
+邮件发送限流（3次/小时）
+Token 验证（有效/无效/过期/已使用）
+密码重置成功
+密码历史检查（新密码不能与最近5次相同）
+重置后 Remember Me Token 被清除
+防用户枚举（不存在的邮箱返回相同提示）
+OAuth 用户提示无需重置密码
+测试登出流程：
+登出当前会话
+登出所有设备
+Cookie 正确清除（Session Cookie + Remember Me Cookie）
+Remember Me Token 正确清除
+跨子域名 Cookie 清除
+移除指定设备
+获取登录设备列表
+Redis Session 和 Tenant DB user_sessions 同步删除
+测试用户邀请流程：
+org_owner 发送邀请（可邀请 admin/member，不能邀请 owner）
+org_admin 发送邀请（只能邀请 member）
+member 无邀请权限
+邀请限流（组织 10 次/小时，邮箱 3 次/小时）
+发送邀请时在 Tenant DB 创建 user_invitations 记录（status='pending'）
+邀请已注册用户：
+Token 验证
+已登录且邮箱匹配：直接接受
+已登录但邮箱不匹配：提示切换账号
+未登录：跳转登录后返回
+接受后在 Manager DB user_orgs 创建关系记录
+接受后在 Tenant DB users 表创建记录
+接受后更新 Tenant DB user_invitations.status='accepted'
+邀请未注册用户：
+显示注册 + 接受邀请表单
+注册并加入组织
+创建 Manager DB org_users 和 user_orgs 记录
+创建 Tenant DB users 记录
+更新 Tenant DB user_invitations.status='accepted'
+在 Tenant DB 创建 user_sessions 记录，自动登录
+撤销邀请（删除 user_invitations 记录）
+重新发送邀请
+查看邀请列表（按状态筛选）
+用户已是成员时提示错误
+同一邮箱已有待处理邀请时提示错误
+14.2 安全测试
+验证密码哈希强度
+验证 Cookie 安全设置
+验证邮件限流功能
+验证 Token 签名和过期
+验证跨子域名会话共享
+14.3 命令
+
+# 运行测试
+npm run test
+
+# 运行完整检查
+npm run all
+
+# 本地启动测试
+npm run dev
+15. 定期维护任务
+15.1 清理过期数据
+
+// Manager DB 维护任务（每天执行一次）
+async function cleanupManagerDbExpiredRecords() {
+  // 清理过期的 email_verifications（未使用且已过期的记录）
+  await emailVerificationDao.deleteExpired();
+
+  // 清理过期的 rememberme_tokens
+  await rememberMeTokenDao.deleteExpired();
+
+  // 清理超过限制的 password_history 记录（保留每用户最近 5 条）
+  await passwordHistoryDao.cleanupExcessRecords(5);
+}
+
+// Tenant DB 维护任务（每个租户每天执行一次）
+async function cleanupTenantDbExpiredRecords(tenantDb: TenantDatabase) {
+  // 清理过期的 user_sessions
+  await tenantDb.userSessions.destroy({
+    where: { expires_at: { [Op.lt]: new Date() } }
+  });
+
+  // 将过期的 user_invitations 标记为 expired（保留记录用于审计）
+  await tenantDb.userInvitations.update(
+    { status: 'expired' },
+    { where: { status: 'pending', expires_at: { [Op.lt]: new Date() } } }
+  );
+}
+15.2 监控指标
+指标	描述
+registration_count	注册数量
+activation_rate	激活率
+email_sent_count	邮件发送数量
+email_rate_limit_hits	邮件限流触发次数
+login_failure_count	登录失败次数
+brute_force_blocks	暴力破解锁定次数
+password_reset_requests	密码重置请求数量
+password_reset_success	密码重置成功数量
+password_reset_token_invalid	无效/过期/已使用 Token 数量
+logout_count	登出当前会话次数
+logout_all_devices_count	登出所有设备次数
+invitation_sent_count	发送邀请数量
+invitation_accepted_count	接受邀请数量
+invitation_rate_limit_hits	邀请限流触发次数
+invitation_deleted_count	撤销/删除邀请数量
